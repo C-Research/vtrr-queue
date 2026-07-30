@@ -79,15 +79,12 @@ class _VTRRCeleryTask(Task):
     """Base task for VTRR-dispatched functions.
 
     Overriding retry() means a task can only ever re-run *itself* with its
-    own payload — the dequeue machinery is invisible to the user. This is
-    the single choke point for both manual self.retry() and autoretry_for,
-    since the latter calls self.retry() internally.
+    own payload
     """
 
     def retry(self, args=None, kwargs=None, exc=None, **options):
         payload = getattr(self.request, "vtrr_payload", None)
-        # Force the current payload; ignore caller args so a VTRR task can
-        # never redequeue. countdown/max_retries/etc. pass through options.
+        kwargs["task_payload"] = payload
         return super().retry(
             args=(),
             kwargs={"task_payload": payload},
@@ -105,7 +102,7 @@ def _resolve_base(user_base: type | None) -> type:
     if user_base is None or user_base is Task:
         return _VTRRCeleryTask
     if issubclass(user_base, _VTRRCeleryTask):
-        return user_base  # user already mixed it in — don't double-wrap
+        return user_base
     return type(f"VTRR{user_base.__name__}", (_VTRRCeleryTask, user_base), {})
 
 
@@ -133,21 +130,8 @@ class VTRRQueue:
         """
         Decorator that registers a function as a VTRR-dispatchable Celery task.
 
-        The first argument is always `self` (the bound Celery task), followed
-        by `task_id`, then any args/kwargs from .queue():
+        The first argument is always `self` (the bound Celery task), then any args/kwargs from .queue():
 
-            @vtrr.task
-            def my_task(self, task_id, x, y): ...
-
-            # Manual retry — no payload threading, just retry the current task:
-            @vtrr.task(max_retries=3, soft_time_limit=60)
-            def my_task(self, task_id, x, y):
-                try:
-                    ...
-                except TransientError as exc:
-                    self.retry(exc=exc, countdown=30)
-
-            # Or declaratively:
             @vtrr.task(autoretry_for=(TransientError,), max_retries=3,
                        retry_backoff=True)
             def my_task(self, task_id, x, y): ...
