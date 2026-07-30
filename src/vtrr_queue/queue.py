@@ -64,7 +64,6 @@ class VTRRTask:
             payload = json.dumps(
                 {
                     "task_name": self.name,
-                    "task_id": task_id,
                     "args": task.get("args", []),
                     "kwargs": task.get("kwargs", {}),
                 }
@@ -72,6 +71,7 @@ class VTRRTask:
             argv += [user_id, task_id, payload]
 
         self._vtrr._enqueue(argv)
+        # TODO: Make the enqueue not commit until schedule_workers succeeds
         self._vtrr._schedule_workers(len(tasks), self._celery_task)
 
 
@@ -170,16 +170,14 @@ class VTRRQueue:
                     result = vtrr._dequeue()
                     if result is None:
                         return  # queue empty — stop draining, no reschedule
-                    dequeued_name, task_id, args, kwargs = result
+                    dequeued_name, args, kwargs = result
                     task_payload = {
                         "task_name": dequeued_name,
-                        "task_id": task_id,
                         "args": args,
                         "kwargs": kwargs,
                     }
                 else:
                     dequeued_name = task_payload["task_name"]
-                    task_id = task_payload["task_id"]
                     args = task_payload["args"]
                     kwargs = task_payload["kwargs"]
 
@@ -194,7 +192,7 @@ class VTRRQueue:
                             "vtrr_queue: unknown task %r — dropped", dequeued_name
                         )
                         return
-                    registered._fn(celery_task, task_id, *args, **kwargs)
+                    registered._fn(celery_task, *args, **kwargs)
                 finally:
                     vtrr._schedule_next(celery_task)
 
@@ -238,7 +236,6 @@ class VTRRQueue:
         payload = json.loads(payload_bytes)
         return (
             payload["task_name"],
-            payload["task_id"],
             payload["args"],
             payload["kwargs"],
         )
