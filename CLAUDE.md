@@ -21,7 +21,7 @@ src/vtrr_queue/
   py.typed          # PEP 561 marker
   scripts/
     enqueue.lua     # bulk enqueue, called by VTRRTask.queue()
-    dequeue.lua     # pops one task, called by dequeue_and_dispatch
+    dequeue.lua     # pops one task, called by each @vtrr.task celery wrapper
 tests/              # empty — needs fakeredis-based tests
 ```
 
@@ -30,8 +30,8 @@ tests/              # empty — needs fakeredis-based tests
 - **Single source file** (`queue.py`) — do not split into multiple modules unless the file becomes unmanageable.
 - **No Django dependency** — the library must work with plain Celery + redis-py. Django integration is the consumer's responsibility (`get_redis_connection`, settings wiring, etc.).
 - **No enqueue.lua modification without updating dequeue.lua** — the two scripts share assumptions about key layout and must stay consistent. Both are atomic Lua scripts; never replace them with multi-command Python.
-- **`dequeue_and_dispatch` is a router only** — it pops from Redis and calls `registered._celery_task.apply_async()`. Task-specific logic (retries, timeouts, base class) belongs on `@vtrr.task(...)`, not on the dispatcher.
-- **`celery_queue` is used for both** `dequeue_and_dispatch` scheduling and the downstream `@vtrr.task` dispatch — both `apply_async` calls pass `queue=vtrr._celery_queue` explicitly, bypassing the consumer's `task_routes`.
+- **`@vtrr.task` IS the Celery task** — the decorator wraps the user function in a Celery task whose body calls `vtrr._dequeue()` then invokes the function directly. One broker hop total; no intermediate dispatcher task.
+- **`celery_queue` is passed explicitly** in every `apply_async` call, bypassing the consumer's `task_routes`.
 
 ## Redis key contract
 

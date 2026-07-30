@@ -3,6 +3,8 @@ import logging
 import uuid
 from pathlib import Path
 from typing import Any, Callable
+from celery import Task
+
 
 import redis as redis_lib
 
@@ -23,7 +25,7 @@ class VTRRTask:
     def __init__(self, fn: Callable, vtrr: "VTRRQueue", celery_task: Any) -> None:
         self._fn = fn
         self._vtrr = vtrr
-        self._celery_task = celery_task  # the @celery_app.task-wrapped version of fn
+        self._celery_task = celery_task
         self.__name__ = fn.__name__
         self.__module__ = fn.__module__
         self.__doc__ = fn.__doc__
@@ -70,7 +72,41 @@ class VTRRTask:
             argv += [user_id, task_id, payload]
 
         self._vtrr._enqueue(argv)
-        self._vtrr._schedule_workers(len(tasks))
+        self._vtrr._schedule_workers(len(tasks), self._celery_task)
+
+
+class _VTRRCeleryTask(Task):
+    """Base task for VTRR-dispatched functions.
+
+    Overriding retry() means a task can only ever re-run *itself* with its
+    own payload — the dequeue machinery is invisible to the user. This is
+    the single choke point for both manual self.retry() and autoretry_for,
+    since the latter calls self.retry() internally.
+    """
+
+    def retry(self, args=None, kwargs=None, exc=None, **options):
+        payload = getattr(self.request, "vtrr_payload", None)
+        # Force the current payload; ignore caller args so a VTRR task can
+        # never redequeue. countdown/max_retries/etc. pass through options.
+        return super().retry(
+            args=(),
+            kwargs={"task_payload": payload},
+            exc=exc,
+            **options,
+        )
+
+
+def _resolve_base(user_base: type | None) -> type:
+    """Weave _VTRRTask into the user's custom Task base.
+
+    _VTRRTask goes first in the MRO so its retry() normalizes the call into
+    the current payload before any user-defined retry runs.
+    """
+    if user_base is None or user_base is Task:
+        return _VTRRCeleryTask
+    if issubclass(user_base, _VTRRCeleryTask):
+        return user_base  # user already mixed it in — don't double-wrap
+    return type(f"VTRR{user_base.__name__}", (_VTRRCeleryTask, user_base), {})
 
 
 class VTRRQueue:
@@ -92,31 +128,82 @@ class VTRRQueue:
         self._enqueue_script = self._load_script("enqueue")
         self._dequeue_script = self._load_script("dequeue")
         self._broker: redis_lib.Redis | None = self._connect_broker()
-        self._register_dispatcher()
 
     def task(self, fn: Callable | None = None, **task_options: Any) -> Any:
         """
         Decorator that registers a function as a VTRR-dispatchable Celery task.
 
-        Accepts the same keyword arguments as @celery_app.task():
+        The first argument is always `self` (the bound Celery task), followed
+        by `task_id`, then any args/kwargs from .queue():
 
-            @vtrr.task(base=MyBaseTask, max_retries=3, retry_kwargs={"countdown": 10})
-            def my_task(task_id, x, y): ...
+            @vtrr.task
+            def my_task(self, task_id, x, y): ...
+
+            # Manual retry — no payload threading, just retry the current task:
+            @vtrr.task(max_retries=3, soft_time_limit=60)
+            def my_task(self, task_id, x, y):
+                try:
+                    ...
+                except TransientError as exc:
+                    self.retry(exc=exc, countdown=30)
+
+            # Or declaratively:
+            @vtrr.task(autoretry_for=(TransientError,), max_retries=3,
+                       retry_backoff=True)
+            def my_task(self, task_id, x, y): ...
         """
 
         def decorator(f: Callable) -> VTRRTask:
-            celery_task = self._celery_app.task(
-                name=f"{f.__module__}.{f.__name__}",
-                **task_options,
-            )(f)
-            wrapped = VTRRTask(f, self, celery_task)
+            vtrr = self
+            options = dict(task_options)
+            options.pop("bind", None)  # always bound
+            base = _resolve_base(options.pop("base", None))
+            task_name = f"{f.__module__}.{f.__name__}"
+
+            @self._celery_app.task(name=task_name, bind=True, base=base, **options)
+            def celery_wrapper(
+                celery_task: Any, task_payload: dict | None = None
+            ) -> None:
+                dispatched = task_payload is None
+
+                if dispatched:
+                    result = vtrr._dequeue()
+                    if result is None:
+                        return  # queue empty — stop draining, no reschedule
+                    dequeued_name, task_id, args, kwargs = result
+                    task_payload = {
+                        "task_name": dequeued_name,
+                        "task_id": task_id,
+                        "args": args,
+                        "kwargs": kwargs,
+                    }
+                else:
+                    dequeued_name = task_payload["task_name"]
+                    task_id = task_payload["task_id"]
+                    args = task_payload["args"]
+                    kwargs = task_payload["kwargs"]
+
+                # Per-invocation stash (safe under threaded/gevent pools);
+                # retry() reads this to re-run the same item.
+                celery_task.request.vtrr_payload = task_payload
+
+                try:
+                    registered = vtrr._registry.get(dequeued_name)
+                    if registered is None:
+                        logger.error(
+                            "vtrr_queue: unknown task %r — dropped", dequeued_name
+                        )
+                        return
+                    registered._fn(celery_task, task_id, *args, **kwargs)
+                finally:
+                    vtrr._schedule_next(celery_task)
+
+            wrapped = VTRRTask(f, self, celery_wrapper)
             self._registry[wrapped.name] = wrapped
             return wrapped
 
         if fn is not None:
-            # Used as @vtrr.task with no arguments
             return decorator(fn)
-        # Used as @vtrr.task(...) with arguments
         return decorator
 
     # ------------------------------------------------------------------
@@ -133,31 +220,6 @@ class VTRRQueue:
         except Exception as err:
             logger.warning("vtrr_queue: could not connect to Celery broker: %s", err)
             return None
-
-    def _register_dispatcher(self) -> None:
-        """
-        Register the internal dequeue-and-dispatch task on the user's Celery app.
-        This task pops one item from Redis and forwards it to the registered Celery task.
-        """
-        vtrr = self
-
-        @self._celery_app.task(name="vtrr_queue.dequeue_and_dispatch")
-        def dequeue_and_dispatch() -> None:
-            result = vtrr._dequeue()
-            if result is None:
-                return
-            task_name, task_id, args, kwargs = result
-            registered = vtrr._registry.get(task_name)
-            if registered is None:
-                logger.error("vtrr_queue: unknown task %r — dropped", task_name)
-                return
-            registered._celery_task.apply_async(
-                args=[task_id, *args],
-                kwargs=kwargs,
-                queue=vtrr._celery_queue,
-            )
-
-        self._dispatch_task = dequeue_and_dispatch
 
     # ------------------------------------------------------------------
     # Internal: Redis operations
@@ -187,7 +249,7 @@ class VTRRQueue:
 
     def _get_workers_scheduled(self) -> int:
         """
-        Count queued dequeue_and_dispatch messages in the Celery broker.
+        Count pending messages in the Celery broker queue.
         Does NOT include workers already running; returns 0 on any error
         so the caller may over-schedule slightly, which is safe.
         """
@@ -207,8 +269,20 @@ class VTRRQueue:
             )
             return 0
 
-    def _schedule_workers(self, num_tasks: int) -> None:
+    def _schedule_workers(self, num_tasks: int, dispatch_task: Any) -> None:
         workers_scheduled = self._get_workers_scheduled()
         to_schedule = min(self._max_concurrency - workers_scheduled, num_tasks)
         for _ in range(to_schedule):
-            self._dispatch_task.apply_async(queue=self._celery_queue)
+            dispatch_task.apply_async(queue=self._celery_queue)
+
+    def _schedule_next(self, current_celery_task: Any) -> None:
+        """Schedule one more dequeue worker if tasks remain in the queue."""
+        try:
+            if self._redis.zcard(_QUEUE_KEY) > 0:
+                current_celery_task.apply_async(queue=self._celery_queue)
+        except Exception as err:
+            logger.error(
+                "vtrr_queue: could not schedule next dequeue worker: %s",
+                err,
+                exc_info=True,
+            )

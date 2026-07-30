@@ -36,17 +36,16 @@ User A submits 10 tasks ──┐
 User B submits  2 tasks ──┼──► Redis sorted set (score = virtual time)
 User C submits  5 tasks ──┘          │
                                      ▼
-                          vtrr_queue.dequeue_and_dispatch  (Celery task, owned by this library)
-                                     │
-                                     ▼
-                          Your @vtrr.task function runs
+                          Your @vtrr.task Celery worker runs,
+                          pops the highest-priority task from Redis,
+                          and calls your function directly
 ```
 
 When `.queue()` is called the library:
 1. Atomically writes all tasks to Redis with fair virtual-time scores (Lua script, no race conditions).
-2. Schedules `min(max_concurrency - workers_already_queued, num_tasks_just_enqueued)` Celery dequeue workers.
+2. Schedules `min(max_concurrency - workers_already_queued, num_tasks_just_enqueued)` Celery workers.
 
-Workers call `vtrr_queue.dequeue_and_dispatch`, which pops the highest-priority task from Redis and forwards it to the appropriate registered Celery task. You never write a dequeue loop.
+Each `@vtrr.task` is itself the Celery task — when a worker picks it up, it dequeues from Redis and calls your function in one hop. There is no intermediate dispatcher task.
 
 
 ## Setup
@@ -105,25 +104,28 @@ from myapp.celery_utils import LogErrorsTask
 
 # No options — plain decorator
 @vtrr.task
-def process_file(task_id: str, file_key: str, dataset_id: str, force_ocr: bool = False):
+def process_file(self, task_id: str, file_key: str, dataset_id: str, force_ocr: bool = False):
     print(f"Processing {file_key} for dataset {dataset_id} (task {task_id})")
     ...
 
-# With Celery task options
+# With retries — self.retry() re-queues to the broker and frees the worker immediately
 @vtrr.task(
     base=LogErrorsTask,
     max_retries=3,
-    retry_kwargs={"countdown": 10},
     soft_time_limit=3600,
     acks_late=True,
 )
-def process_large_file(task_id: str, file_key: str, dataset_id: str):
-    ...
+def process_large_file(self, task_id: str, file_key: str, dataset_id: str):
+    try:
+        ...
+    except TransientError as exc:
+        # Pass self._vtrr_payload so the retry re-runs THIS task, not the next one
+        raise self.retry(exc=exc, kwargs={"task_payload": self._vtrr_payload}, countdown=10)
 ```
 
-`task_id` is always injected as the first positional argument by the dispatcher. All remaining args and kwargs come from what was passed to `.queue()`.
+`self` is the bound Celery task and is always the first argument. `task_id` is second, followed by any args/kwargs passed to `.queue()`. Do not pass `bind=True` — it is always set by the library.
 
-Each task gets its own Celery task registration with its own retry and timeout settings. Retries, time limits, and base classes apply to your function directly — not to the shared dequeue step.
+Each task gets its own Celery task registration with its own retry and timeout settings. Because the `@vtrr.task` wrapper IS the Celery task, retries and time limits apply to the full dequeue-and-execute unit.
 
 This module must be imported at Celery worker startup. In Django projects the standard way is to import it in your `AppConfig.ready()`:
 
@@ -259,7 +261,7 @@ from myapp.celery_utils import LogErrorsTask
     retry_kwargs={"countdown": 10},
     soft_time_limit=3600,
 )
-def process_upload(task_id: str, file_key: str, dataset_id: str):
+def process_upload(self, task_id: str, file_key: str, dataset_id: str):
     ...
 ```
 
