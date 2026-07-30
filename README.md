@@ -63,15 +63,14 @@ from vtrr_queue import VTRRQueue
 celery_app = Celery(...)  # or import your existing app
 
 vtrr = VTRRQueue(
-    redis_client=redis.from_url("redis://localhost:6379/3"),  # /3 = database index 3
+    redis_client=redis.from_url("redis://localhost:6379/3"),
     celery_app=celery_app,
-    celery_queue="vtrr_queue",   # name of the Celery queue workers will consume
+    celery_queue="vtrr_queue",   # name of the Celery queue workers will consume (separate from the round-robin queue)
     max_concurrency=8,           # cap on dequeue workers queued in the broker at once
 )
 ```
 
-The trailing `/<n>` in the Redis URL selects the database index. Redis ships with 16 databases (0–15) by default. Use a dedicated one for the VTRR queue so its keys don't collide with your application cache, session store, or Celery broker. Database 0 is the default when no index is given.
-
+Use a dedicated Redis DB index for the VTRR queue so its keys don't collide with your application cache, session store, or Celery broker.
 #### VTRRQueue parameters
 
 | Parameter | Type | Default | Description |
@@ -90,7 +89,7 @@ The VTRR dispatcher runs on its own Celery queue. Start a worker that consumes o
 celery -A myapp worker -Q vtrr_queue --concurrency=8 --loglevel=info
 ```
 
-The `--concurrency` here is the OS-level worker pool size. `max_concurrency` in `VTRRQueue` controls how many dispatcher tasks are *pre-queued* in the broker at once, which is a separate concern.
+The `--concurrency` here is the OS-level worker pool size. `max_concurrency` in `VTRRQueue` controls how many dispatcher tasks are *pre-queued* in the broker at once, which is this concurrency value multiplied by the number of worker instances you deploy.
 
 
 ### 3. Define tasks
@@ -103,54 +102,31 @@ from myapp.vtrr import vtrr
 from myapp.celery_utils import LogErrorsTask
 
 # No options — plain decorator
-@vtrr.task
-def process_file(self, task_id: str, file_key: str, dataset_id: str, force_ocr: bool = False):
-    print(f"Processing {file_key} for dataset {dataset_id} (task {task_id})")
-    ...
-
-# With retries — self.retry() re-queues to the broker and frees the worker immediately
 @vtrr.task(
     base=LogErrorsTask,
     max_retries=3,
     soft_time_limit=3600,
     acks_late=True,
 )
-def process_large_file(self, task_id: str, file_key: str, dataset_id: str):
+def process_file(self, task_id: str, file_key: str, dataset_id: str, force_ocr: bool = False):
     try:
         ...
     except TransientError as exc:
-        # Pass self._vtrr_payload so the retry re-runs THIS task, not the next one
-        raise self.retry(exc=exc, kwargs={"task_payload": self._vtrr_payload}, countdown=10)
+        # Retry will requeue the specific task to the broker
+        raise self.retry(exc=exc, countdown=10)
 ```
 
-`self` is the bound Celery task and is always the first argument. `task_id` is second, followed by any args/kwargs passed to `.queue()`. Do not pass `bind=True` — it is always set by the library.
+`self` is the bound Celery task and is always the first argument, followed by any args/kwargs passed to `.queue()`. bound is always True despite what you may set in the decorator.
 
-Each task gets its own Celery task registration with its own retry and timeout settings. Because the `@vtrr.task` wrapper IS the Celery task, retries and time limits apply to the full dequeue-and-execute unit.
-
-This module must be imported at Celery worker startup. In Django projects the standard way is to import it in your `AppConfig.ready()`:
-
-```python
-# myapp/apps.py
-class MyAppConfig(AppConfig):
-    def ready(self):
-        import myapp.tasks
-```
+Each task gets its own Celery task registration with its own retry and timeout settings.
 
 
 ### 4. Enqueue tasks
 
-Call `.queue()` from anywhere in your application — views, signals, management commands, etc.:
+Call `.queue()` from anywhere in your application to enqueue the task in the round-robin for celery to run.
 
 ```python
 from myapp.tasks import process_file
-
-# Single task
-process_file.queue(
-    user_id="u_123",
-    tasks=[
-        {"args": ["s3://bucket/report.pdf"], "kwargs": {"dataset_id": "d_456"}},
-    ],
-)
 
 # Bulk enqueue — all tasks from one user in a single Redis round-trip
 process_file.queue(
@@ -219,7 +195,7 @@ CACHES = {
 }
 
 VTRR_CELERY_SCHEDULER_QUEUE = "vtrr_queue"
-VTRR_MAX_CONCURRENCY = 8       # dequeue workers pre-queued in broker
+VTRR_MAX_CONCURRENCY = 8
 ```
 
 ```python
@@ -237,7 +213,7 @@ vtrr = VTRRQueue(
 )
 ```
 
-`get_redis_connection` returns the underlying `redis.Redis` client from the named `CACHES` entry, which respects the `DB` index and any connection pooling configured there. This is the recommended approach over a bare `redis.from_url()` in Django projects since it integrates with Django's connection management.
+`get_redis_connection` is the recommended approach over a bare `redis.from_url()` in Django projects since it integrates with Django's connection management.
 
 ```python
 # myapp/apps.py
@@ -247,7 +223,7 @@ class MyAppConfig(AppConfig):
     name = "myapp"
 
     def ready(self):
-        import myapp.tasks  # registers @vtrr.task functions with the dispatcher
+        import myapp.tasks  # registers @vtrr.task functions with the dispatcher if needed
 ```
 
 ```python
