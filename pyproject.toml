@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vtrr-queue"
+version = "0.1.0"
+description = "Virtual-time round-robin fair queue on Redis"
+requires-python = ">=3.11"
+dependencies = ["redis>=5.0", "celery>=5.0"]
+
+[project.optional-dependencies]
+dev = ["pytest", "fakeredis"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/vtrr_queue/scripts" = "vtrr_queue/scripts"
