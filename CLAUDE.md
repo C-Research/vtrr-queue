@@ -1,0 +1,68 @@
+# CLAUDE.md
+
+Read README.md for full usage documentation, API reference, and Django integration examples.
+
+## Keeping docs current
+
+After any edit, check whether it makes anything in CLAUDE.md or README.md factually wrong or misleading. If so, update only the affected parts. Do not add new documentation for every change — only update when something that is already written has become incorrect or incomplete in a way that would mislead a future developer. New features or API additions warrant README and CLAUDE.md updates only if they are central to how the library is used.
+
+## What this repo is
+
+A standalone Python library (`vtrr-queue`) that will be imported by a separate Django/Celery application. It is not a Django app itself — no models, no views, no settings. It has no knowledge of the consuming project's domain.
+
+The consuming project lives in a separate repo. This library is currently installed via GitHub pip URL; AWS CodeArtifact is the eventual target.
+
+## Repo layout
+
+```
+src/vtrr_queue/
+  __init__.py       # public API: VTRRQueue, VTRRTask
+  queue.py          # all logic lives here — single file by design
+  py.typed          # PEP 561 marker
+  scripts/
+    enqueue.lua     # bulk enqueue, called by VTRRTask.queue()
+    dequeue.lua     # pops one task, called by dequeue_and_dispatch
+tests/              # empty — needs fakeredis-based tests
+```
+
+## Key design constraints
+
+- **Single source file** (`queue.py`) — do not split into multiple modules unless the file becomes unmanageable.
+- **No Django dependency** — the library must work with plain Celery + redis-py. Django integration is the consumer's responsibility (`get_redis_connection`, settings wiring, etc.).
+- **No enqueue.lua modification without updating dequeue.lua** — the two scripts share assumptions about key layout and must stay consistent. Both are atomic Lua scripts; never replace them with multi-command Python.
+- **`dequeue_and_dispatch` is a router only** — it pops from Redis and calls `registered._celery_task.apply_async()`. Task-specific logic (retries, timeouts, base class) belongs on `@vtrr.task(...)`, not on the dispatcher.
+- **`celery_queue` is used for both** `dequeue_and_dispatch` scheduling and the downstream `@vtrr.task` dispatch — both `apply_async` calls pass `queue=vtrr._celery_queue` explicitly, bypassing the consumer's `task_routes`.
+
+## Redis key contract
+
+Four fixed keys — do not rename without updating both Lua scripts and the README:
+
+| Key | Structure |
+|---|---|
+| `vtrr:queue` | Sorted set: `task_id → virtual_time` |
+| `vtrr:current_virtual_time` | String |
+| `vtrr:user_virtual_time` | Hash: `user_id → virtual_time` |
+| `vtrr:task` | Hash: `task_id → JSON payload` |
+
+JSON payload shape: `{"task_name": str, "task_id": str, "args": list, "kwargs": dict}`
+
+All four keys are deleted/reset when the queue drains (handled in `dequeue.lua`).
+
+## Worker scheduling logic
+
+`_schedule_workers(num_tasks)` schedules `min(max_concurrency - workers_scheduled, num_tasks)` Celery tasks after every `.queue()` call. `_get_workers_scheduled()` counts broker list lengths across Celery's four Redis priority suffixes (`""`, `":3"`, `":6"`, `":9"`). It returns `0` on any error so scheduling may over-fire slightly — this is intentional and safe.
+
+## Development setup
+
+```
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+```
+
+Tests use `fakeredis`. A real Celery app is needed to test dispatch end-to-end; unit tests should mock `celery_app` and assert on `apply_async` calls.
+
+## Not yet done
+
+- No tests exist — `tests/` is empty.
+- `VTRRTask.name` uses `__module__.__name__` which breaks if the same function is registered under two different `VTRRQueue` instances (name collision in `_registry`).
+- No way to inspect queue depth or per-user position from Python — would require thin wrappers around `ZCARD` / `ZRANK`.
