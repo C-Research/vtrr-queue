@@ -20,9 +20,10 @@ _DEQUEUE_KEYS = [_QUEUE_KEY, _CURRENT_VT_KEY, _TASK_LOOKUPS_KEY, _USERS_VT_KEY]
 
 
 class VTRRTask:
-    def __init__(self, fn: Callable, vtrr: "VTRRQueue") -> None:
+    def __init__(self, fn: Callable, vtrr: "VTRRQueue", celery_task: Any) -> None:
         self._fn = fn
         self._vtrr = vtrr
+        self._celery_task = celery_task  # the @celery_app.task-wrapped version of fn
         self.__name__ = fn.__name__
         self.__module__ = fn.__module__
         self.__doc__ = fn.__doc__
@@ -93,11 +94,34 @@ class VTRRQueue:
         self._broker: redis_lib.Redis | None = self._connect_broker()
         self._register_dispatcher()
 
-    def task(self, fn: Callable) -> VTRRTask:
-        """Decorator that registers a function as a VTRR-dispatchable task."""
-        wrapped = VTRRTask(fn, self)
-        self._registry[wrapped.name] = wrapped
-        return wrapped
+    def task(self, fn: Callable | None = None, **task_options: Any) -> Any:
+        """
+        Decorator that registers a function as a VTRR-dispatchable Celery task.
+
+        Accepts the same keyword arguments as @celery_app.task():
+
+            @vtrr.task(base=MyBaseTask, max_retries=3, retry_kwargs={"countdown": 10})
+            def my_task(task_id, x, y): ...
+        """
+
+        def decorator(f: Callable) -> VTRRTask:
+            celery_task = self._celery_app.task(
+                name=f"{f.__module__}.{f.__name__}",
+                **task_options,
+            )(f)
+            wrapped = VTRRTask(f, self, celery_task)
+            self._registry[wrapped.name] = wrapped
+            return wrapped
+
+        if fn is not None:
+            # Used as @vtrr.task with no arguments
+            return decorator(fn)
+        # Used as @vtrr.task(...) with arguments
+        return decorator
+
+    # ------------------------------------------------------------------
+    # Internal: setup
+    # ------------------------------------------------------------------
 
     def _load_script(self, name: str) -> Any:
         src = (_SCRIPTS_DIR / f"{name}.lua").read_text()
@@ -111,7 +135,10 @@ class VTRRQueue:
             return None
 
     def _register_dispatcher(self) -> None:
-        """Register the internal dequeue-and-dispatch task on the user's Celery app."""
+        """
+        Register the internal dequeue-and-dispatch task on the user's Celery app.
+        This task pops one item from Redis and forwards it to the registered Celery task.
+        """
         vtrr = self
 
         @self._celery_app.task(name="vtrr_queue.dequeue_and_dispatch")
@@ -124,14 +151,22 @@ class VTRRQueue:
             if registered is None:
                 logger.error("vtrr_queue: unknown task %r — dropped", task_name)
                 return
-            registered._fn(task_id, *args, **kwargs)
+            registered._celery_task.apply_async(
+                args=[task_id, *args],
+                kwargs=kwargs,
+                queue=vtrr._celery_queue,
+            )
 
         self._dispatch_task = dequeue_and_dispatch
+
+    # ------------------------------------------------------------------
+    # Internal: Redis operations
+    # ------------------------------------------------------------------
 
     def _enqueue(self, argv: list[str]) -> None:
         self._enqueue_script(keys=_ENQUEUE_KEYS, args=argv)
 
-    def _dequeue(self) -> tuple[str, list, dict] | None:
+    def _dequeue(self) -> tuple[str, str, list, dict] | None:
         raw = self._dequeue_script(keys=_DEQUEUE_KEYS, args=[])
         if not raw:
             return None
@@ -145,6 +180,10 @@ class VTRRQueue:
             payload["args"],
             payload["kwargs"],
         )
+
+    # ------------------------------------------------------------------
+    # Internal: worker scheduling
+    # ------------------------------------------------------------------
 
     def _get_workers_scheduled(self) -> int:
         """
