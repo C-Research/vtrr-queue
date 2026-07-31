@@ -271,3 +271,9 @@ The library manages four keys in Redis. These are fixed and not configurable.
 | `vtrr:task` | Hash | `task_id → JSON payload`; deleted when queue drains |
 
 All enqueue and dequeue operations are atomic Lua scripts, so concurrent writers and workers are safe.
+
+# Development
+
+Run `poetry install`
+
+Tests: `poetry run pytest tests`

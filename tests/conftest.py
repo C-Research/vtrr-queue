@@ -4,7 +4,7 @@ import fakeredis
 import pytest
 from celery import Celery
 
-from src.vtrr_queue.queue import VTRRQueue
+from vtrr_queue.queue import VTRRQueue
 
 
 @pytest.fixture

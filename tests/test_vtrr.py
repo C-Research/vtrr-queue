@@ -6,8 +6,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import src.vtrr_queue.queue as vtrr_module
-from src.vtrr_queue.queue import (
+import vtrr_queue.queue as vtrr_module
+from vtrr_queue.queue import (
     _CURRENT_VT_KEY,
     _DEQUEUE_KEYS,
     _ENQUEUE_KEYS,
