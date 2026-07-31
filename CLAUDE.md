@@ -60,9 +60,3 @@ pip install -e ".[dev]"
 ```
 
 Tests use `fakeredis`. A real Celery app is needed to test dispatch end-to-end; unit tests should mock `celery_app` and assert on `apply_async` calls.
-
-## Not yet done
-
-- No tests exist — `tests/` is empty.
-- `VTRRTask.name` uses `__module__.__name__` which breaks if the same function is registered under two different `VTRRQueue` instances (name collision in `_registry`).
-- No way to inspect queue depth or per-user position from Python — would require thin wrappers around `ZCARD` / `ZRANK`.

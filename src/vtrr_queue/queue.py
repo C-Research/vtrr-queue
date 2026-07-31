@@ -70,9 +70,8 @@ class VTRRTask:
             )
             argv += [user_id, task_id, payload]
 
-        self._vtrr._enqueue(argv)
-        # TODO: Make the enqueue not commit until schedule_workers succeeds
         self._vtrr._schedule_workers(len(tasks), self._celery_task)
+        self._vtrr._enqueue(argv)
 
 
 class _VTRRCeleryTask(Task):
@@ -145,14 +144,22 @@ class VTRRQueue:
 
             @self._celery_app.task(name=task_name, bind=True, base=base, **options)
             def celery_wrapper(
-                celery_task: Any, task_payload: dict | None = None
+                celery_task: Any,
+                task_payload: dict | None = None,
+                is_start: bool = False,
             ) -> None:
                 dispatched = task_payload is None
 
                 if dispatched:
                     result = vtrr._dequeue()
                     if result is None:
-                        # TODO: schedule 1 retry if it's an original task
+                        if is_start:
+                            # Race: worker arrived before enqueue settled — retry once after a short delay.
+                            celery_task.apply_async(
+                                kwargs={"is_start": False},
+                                queue=vtrr._celery_queue,
+                                countdown=3,
+                            )
                         return  # queue empty — stop draining, no reschedule
                     dequeued_name, args, kwargs = result
                     task_payload = {
@@ -256,7 +263,10 @@ class VTRRQueue:
         workers_scheduled = self._get_workers_scheduled()
         to_schedule = min(self._max_concurrency - workers_scheduled, num_tasks)
         for _ in range(to_schedule):
-            dispatch_task.apply_async(queue=self._celery_queue)
+            dispatch_task.apply_async(
+                kwargs={"is_start": True},
+                queue=self._celery_queue,
+            )
 
     def _schedule_next(self, current_celery_task: Any) -> None:
         """Schedule one more dequeue worker if tasks remain in the queue."""
