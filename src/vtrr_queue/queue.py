@@ -84,7 +84,6 @@ class _VTRRCeleryTask(Task):
 
     def retry(self, args=None, kwargs=None, exc=None, **options):
         payload = getattr(self.request, "vtrr_payload", None)
-        kwargs["task_payload"] = payload
         return super().retry(
             args=(),
             kwargs={"task_payload": payload},
@@ -153,6 +152,7 @@ class VTRRQueue:
                 if dispatched:
                     result = vtrr._dequeue()
                     if result is None:
+                        # TODO: schedule 1 retry if it's an original task
                         return  # queue empty — stop draining, no reschedule
                     dequeued_name, args, kwargs = result
                     task_payload = {
@@ -178,7 +178,9 @@ class VTRRQueue:
                         return
                     registered._fn(celery_task, *args, **kwargs)
                 finally:
-                    vtrr._schedule_next(celery_task)
+                    if dispatched:
+                        # In case there's an exception, schedule next dequeue
+                        vtrr._schedule_next(celery_task)
 
             wrapped = VTRRTask(f, self, celery_wrapper)
             self._registry[wrapped.name] = wrapped
