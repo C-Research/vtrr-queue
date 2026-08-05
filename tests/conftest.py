@@ -26,6 +26,6 @@ def redis_client():
 
 @pytest.fixture
 def vtrr(redis_client, celery_app):
-    q = VTRRQueue(redis_client=redis_client, celery_app=celery_app)
+    q = VTRRQueue(redis_client=redis_client, celery_app=celery_app, name="test")
     q._broker = fakeredis.FakeStrictRedis(decode_responses=False)
     return q

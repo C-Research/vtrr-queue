@@ -12,13 +12,6 @@ logger = logging.getLogger(__name__)
 
 _SCRIPTS_DIR = Path(__file__).parent / "scripts"
 
-_QUEUE_KEY = "vtrr:queue"
-_CURRENT_VT_KEY = "vtrr:current_virtual_time"
-_TASK_LOOKUPS_KEY = "vtrr:task"
-_PARTITIONS_VT_KEY = "vtrr:partition_virtual_time"
-
-_ENQUEUE_KEYS = [_CURRENT_VT_KEY, _PARTITIONS_VT_KEY, _QUEUE_KEY, _TASK_LOOKUPS_KEY]
-_DEQUEUE_KEYS = [_QUEUE_KEY, _CURRENT_VT_KEY, _TASK_LOOKUPS_KEY, _PARTITIONS_VT_KEY]
 
 
 class VTRRTask:
@@ -113,6 +106,7 @@ class VTRRQueue:
         redis_client: redis_lib.Redis,
         celery_app: Any,
         *,
+        name: str,
         celery_queue: str = "vtrr_queue",
         max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
     ) -> None:
@@ -121,6 +115,15 @@ class VTRRQueue:
         self._celery_queue = celery_queue
         self._max_concurrency = max_concurrency
         self._registry: dict[str, VTRRTask] = {}
+
+        prefix = f"vtrr:{name}"
+        self._queue_key = f"{prefix}:queue"
+        self._current_vt_key = f"{prefix}:current_virtual_time"
+        self._task_key = f"{prefix}:task"
+        self._partitions_vt_key = f"{prefix}:partition_virtual_time"
+        self._enqueue_keys = [self._current_vt_key, self._partitions_vt_key, self._queue_key, self._task_key]
+        self._dequeue_keys = [self._queue_key, self._current_vt_key, self._task_key, self._partitions_vt_key]
+
         self._enqueue_script = self._load_script("enqueue")
         self._dequeue_script = self._load_script("dequeue")
         self._broker: redis_lib.Redis | None = self._connect_broker()
@@ -218,10 +221,10 @@ class VTRRQueue:
     # ------------------------------------------------------------------
 
     def _enqueue(self, argv: list[str]) -> None:
-        self._enqueue_script(keys=_ENQUEUE_KEYS, args=argv)
+        self._enqueue_script(keys=self._enqueue_keys, args=argv)
 
     def _dequeue(self) -> tuple[str, str, list, dict] | None:
-        raw = self._dequeue_script(keys=_DEQUEUE_KEYS, args=[])
+        raw = self._dequeue_script(keys=self._dequeue_keys, args=[])
         if not raw:
             return None
         _, payload_bytes = raw
@@ -272,7 +275,7 @@ class VTRRQueue:
     def _schedule_next(self, current_celery_task: Any) -> None:
         """Schedule one more dequeue worker if tasks remain in the queue."""
         try:
-            if self._redis.zcard(_QUEUE_KEY) > 0:
+            if self._redis.zcard(self._queue_key) > 0:
                 current_celery_task.apply_async(queue=self._celery_queue)
         except Exception as err:
             logger.error(

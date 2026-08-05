@@ -1,26 +1,19 @@
 """VTRR queue test suite."""
 
 import json
-from pathlib import Path
 from unittest.mock import MagicMock
 
+import fakeredis
 import pytest
 
 import vtrr_queue.queue as vtrr_module
-from vtrr_queue.queue import (
-    _CURRENT_VT_KEY,
-    _DEQUEUE_KEYS,
-    _ENQUEUE_KEYS,
-    _QUEUE_KEY,
-    _TASK_LOOKUPS_KEY,
-    _PARTITIONS_VT_KEY,
-)
+from vtrr_queue.queue import VTRRQueue
 
-SCRIPTS_DIR = Path(vtrr_module.__file__).parent / "scripts"
+SCRIPTS_DIR = vtrr_module._SCRIPTS_DIR
 
 
 def make_argv(task_name, items):
-    """Build flat (partition_key, task_id, payload) triples for enqueue.lua.
+    """Build flat (partition_key, task_id, weight, payload) quads for enqueue.lua.
 
     items: iterable of (partition_key, task_id, args, kwargs).
     """
@@ -32,20 +25,22 @@ def make_argv(task_name, items):
 
 
 @pytest.fixture
-def enqueue_script(redis_client):
-    return redis_client.register_script((SCRIPTS_DIR / "enqueue.lua").read_text())
+def enqueue_script(vtrr):
+    """Bound enqueue callable — takes argv, keys are baked in."""
+    return lambda argv: vtrr._enqueue_script(keys=vtrr._enqueue_keys, args=argv)
 
 
 @pytest.fixture
-def dequeue_script(redis_client):
-    return redis_client.register_script((SCRIPTS_DIR / "dequeue.lua").read_text())
+def dequeue_script(vtrr):
+    """Bound dequeue callable — no arguments needed."""
+    return lambda: vtrr._dequeue_script(keys=vtrr._dequeue_keys, args=[])
 
 
 def drain_all(dequeue_script):
     """Pop everything, returning the ordered list of task_ids (bytes)."""
     order = []
     while True:
-        result = dequeue_script(keys=_DEQUEUE_KEYS, args=[])
+        result = dequeue_script()
         if not result:
             break
         order.append(result[0])
@@ -54,29 +49,25 @@ def drain_all(dequeue_script):
 
 class TestRoundRobin:
     def test_enqueue_assigns_incrementing_virtual_time(
-        self, redis_client, enqueue_script
+        self, vtrr, redis_client, enqueue_script
     ):
         enqueue_script(
-            keys=_ENQUEUE_KEYS,
-            args=make_argv(
+            make_argv(
                 "t",
                 [
                     ("A", "a1", [], {}),
                     ("A", "a2", [], {}),
                     ("A", "a3", [], {}),
                 ],
-            ),
+            )
         )
-        scores = redis_client.zrange(_QUEUE_KEY, 0, -1, withscores=True)
+        scores = redis_client.zrange(vtrr._queue_key, 0, -1, withscores=True)
         assert scores == [(b"a1", 1.0), (b"a2", 2.0), (b"a3", 3.0)]
-        assert redis_client.hget(_PARTITIONS_VT_KEY, "A") == b"4"
+        assert redis_client.hget(vtrr._partitions_vt_key, "A") == b"4"
 
     def test_payload_round_trips(self, enqueue_script, dequeue_script):
-        enqueue_script(
-            keys=_ENQUEUE_KEYS,
-            args=make_argv("myapp.task", [("A", "a1", [1, 2], {"k": "v"})]),
-        )
-        member, payload = dequeue_script(keys=_DEQUEUE_KEYS, args=[])
+        enqueue_script(make_argv("myapp.task", [("A", "a1", [1, 2], {"k": "v"})]))
+        member, payload = dequeue_script()
         assert member == b"a1"
         assert json.loads(payload) == {
             "task_name": "myapp.task",
@@ -88,15 +79,14 @@ class TestRoundRobin:
         self, enqueue_script, dequeue_script
     ):
         enqueue_script(
-            keys=_ENQUEUE_KEYS,
-            args=make_argv(
+            make_argv(
                 "t",
                 [
                     ("A", "a1", [], {}),
                     ("A", "a2", [], {}),
                     ("A", "a3", [], {}),
                 ],
-            ),
+            )
         )
         assert drain_all(dequeue_script) == [b"a1", b"a2", b"a3"]
 
@@ -104,56 +94,54 @@ class TestRoundRobin:
         # A enqueues three, B one just after. B (vt 1) shares the first cohort
         # with a1 (vt 1), so it is served second, not stuck behind a2/a3.
         enqueue_script(
-            keys=_ENQUEUE_KEYS,
-            args=make_argv(
+            make_argv(
                 "t",
                 [
                     ("A", "a1", [], {}),
                     ("A", "a2", [], {}),
                     ("A", "a3", [], {}),
                 ],
-            ),
+            )
         )
-        enqueue_script(keys=_ENQUEUE_KEYS, args=make_argv("t", [("B", "b1", [], {})]))
+        enqueue_script(make_argv("t", [("B", "b1", [], {})]))
         assert drain_all(dequeue_script) == [b"a1", b"b1", b"a2", b"a3"]
 
     def test_current_vt_tracks_last_dequeue(
-        self, redis_client, enqueue_script, dequeue_script
+        self, vtrr, redis_client, enqueue_script, dequeue_script
     ):
         enqueue_script(
-            keys=_ENQUEUE_KEYS,
-            args=make_argv(
+            make_argv(
                 "t",
                 [
                     ("A", "a1", [], {}),
                     ("A", "a2", [], {}),
                 ],
-            ),
+            )
         )
-        dequeue_script(keys=_DEQUEUE_KEYS, args=[])  # pops a1 (vt 1); queue not empty
-        assert float(redis_client.get(_CURRENT_VT_KEY)) == 1.0
+        dequeue_script()  # pops a1 (vt 1); queue not empty
+        assert float(redis_client.get(vtrr._current_vt_key)) == 1.0
 
-    def test_drain_resets_all_state(self, redis_client, enqueue_script, dequeue_script):
-        enqueue_script(keys=_ENQUEUE_KEYS, args=make_argv("t", [("A", "a1", [], {})]))
-        dequeue_script(keys=_DEQUEUE_KEYS, args=[])
-        assert redis_client.get(_CURRENT_VT_KEY) == b"0"
-        assert redis_client.exists(_TASK_LOOKUPS_KEY) == 0
-        assert redis_client.exists(_PARTITIONS_VT_KEY) == 0
+    def test_drain_resets_all_state(self, vtrr, redis_client, enqueue_script, dequeue_script):
+        enqueue_script(make_argv("t", [("A", "a1", [], {})]))
+        dequeue_script()
+        assert redis_client.get(vtrr._current_vt_key) == b"0"
+        assert redis_client.exists(vtrr._task_key) == 0
+        assert redis_client.exists(vtrr._partitions_vt_key) == 0
 
     def test_dequeue_empty_queue_returns_empty(self, dequeue_script):
-        assert dequeue_script(keys=_DEQUEUE_KEYS, args=[]) == []
+        assert dequeue_script() == []
 
-    def test_weight_advances_partition_vt_by_weight(self, redis_client, enqueue_script):
+    def test_weight_advances_partition_vt_by_weight(self, vtrr, redis_client, enqueue_script):
         argv = []
         for task_id, weight in [("a1", 2), ("a2", 1)]:
             payload = json.dumps({"task_name": "t", "args": [], "kwargs": {}})
             argv += ["A", task_id, weight, payload]
-        enqueue_script(keys=_ENQUEUE_KEYS, args=argv)
-        scores = redis_client.zrange(_QUEUE_KEY, 0, -1, withscores=True)
+        enqueue_script(argv)
+        scores = redis_client.zrange(vtrr._queue_key, 0, -1, withscores=True)
         # a1 at vt=1, a2 at vt=1+2=3 (not 2)
         assert scores == [(b"a1", 1.0), (b"a2", 3.0)]
         # partition_vt = 3 + 1 = 4
-        assert redis_client.hget(_PARTITIONS_VT_KEY, "A") == b"4"
+        assert redis_client.hget(vtrr._partitions_vt_key, "A") == b"4"
 
     def test_heavier_weight_yields_more_turns_to_other_partition(
         self, enqueue_script, dequeue_script
@@ -167,8 +155,81 @@ class TestRoundRobin:
         for task_id in ["b1", "b2", "b3"]:
             payload = json.dumps({"task_name": "t", "args": [], "kwargs": {}})
             argv += ["B", task_id, 1, payload]
-        enqueue_script(keys=_ENQUEUE_KEYS, args=argv)
+        enqueue_script(argv)
         assert drain_all(dequeue_script) == [b"a1", b"b1", b"b2", b"a2", b"b3"]
+
+
+class TestMultipleInstances:
+    def test_two_instances_use_separate_redis_keys(self, redis_client, celery_app):
+        files_vtrr = VTRRQueue(
+            redis_client=redis_client, celery_app=celery_app, name="files"
+        )
+        search_vtrr = VTRRQueue(
+            redis_client=redis_client, celery_app=celery_app, name="search"
+        )
+        assert files_vtrr._queue_key != search_vtrr._queue_key
+        assert files_vtrr._queue_key == "vtrr:files:queue"
+        assert search_vtrr._queue_key == "vtrr:search:queue"
+
+    def test_two_instances_do_not_share_queue_state(self, redis_client, celery_app):
+        files_vtrr = VTRRQueue(
+            redis_client=redis_client, celery_app=celery_app, name="files"
+        )
+        files_vtrr._broker = fakeredis.FakeStrictRedis(decode_responses=False)
+        search_vtrr = VTRRQueue(
+            redis_client=redis_client, celery_app=celery_app, name="search"
+        )
+        search_vtrr._broker = fakeredis.FakeStrictRedis(decode_responses=False)
+
+        @files_vtrr.task
+        def process_file(self, name):
+            pass
+
+        @search_vtrr.task
+        def run_search(self, query):
+            pass
+
+        process_file.queue(partition_key="u1", tasks=[{"id": "f1", "args": ["a.pdf"]}])
+
+        # files queue has one item; search queue is empty
+        assert redis_client.zcard(files_vtrr._queue_key) == 1
+        assert redis_client.zcard(search_vtrr._queue_key) == 0
+
+    def test_dequeue_only_pops_from_own_namespace(self, redis_client, celery_app):
+        files_vtrr = VTRRQueue(
+            redis_client=redis_client, celery_app=celery_app, name="files"
+        )
+        files_vtrr._broker = fakeredis.FakeStrictRedis(decode_responses=False)
+        search_vtrr = VTRRQueue(
+            redis_client=redis_client, celery_app=celery_app, name="search"
+        )
+        search_vtrr._broker = fakeredis.FakeStrictRedis(decode_responses=False)
+
+        files_ran = []
+        search_ran = []
+
+        @files_vtrr.task
+        def process_file(self, name):
+            files_ran.append(name)
+
+        @search_vtrr.task
+        def run_search(self, query):
+            search_ran.append(query)
+
+        process_file.queue(
+            partition_key="u1",
+            tasks=[{"kwargs": {"name": "a.pdf"}}, {"kwargs": {"name": "b.pdf"}}],
+        )
+        run_search.queue(
+            partition_key="org1",
+            tasks=[{"kwargs": {"query": "hello"}}],
+        )
+
+        process_file._celery_task.apply(kwargs={"is_start": True})
+        run_search._celery_task.apply(kwargs={"is_start": True})
+
+        assert sorted(files_ran) == ["a.pdf", "b.pdf"]
+        assert search_ran == ["hello"]
 
 
 class TestCeleryScheduling:
@@ -190,7 +251,7 @@ class TestCeleryScheduling:
         assert task.apply_async.call_count == 0
 
     def test_schedule_next_reschedules_when_queue_nonempty(self, vtrr):
-        vtrr._redis.zadd(_QUEUE_KEY, {"t1": 1})
+        vtrr._redis.zadd(vtrr._queue_key, {"t1": 1})
         task = MagicMock()
         vtrr._schedule_next(task)
         task.apply_async.assert_called_once()

@@ -35,14 +35,14 @@ tests/              # empty — needs fakeredis-based tests
 
 ## Redis key contract
 
-Four fixed keys — do not rename without updating both Lua scripts and the README:
+Each `VTRRQueue` instance namespaces its four keys under `vtrr:{name}:*`. Do not rename without updating both Lua scripts and the README.
 
 | Key | Structure |
 |---|---|
-| `vtrr:queue` | Sorted set: `task_id → virtual_time` |
-| `vtrr:current_virtual_time` | String |
-| `vtrr:user_virtual_time` | Hash: `user_id → virtual_time` |
-| `vtrr:task` | Hash: `task_id → JSON payload` |
+| `vtrr:{name}:queue` | Sorted set: `task_id → virtual_time` |
+| `vtrr:{name}:current_virtual_time` | String |
+| `vtrr:{name}:partition_virtual_time` | Hash: `partition_key → virtual_time` |
+| `vtrr:{name}:task` | Hash: `task_id → JSON payload` |
 
 JSON payload shape: `{"task_name": str, "args": list, "kwargs": dict}`
 

@@ -65,6 +65,7 @@ celery_app = Celery(...)  # or import your existing app
 vtrr = VTRRQueue(
     redis_client=redis.from_url("redis://localhost:6379/3"),
     celery_app=celery_app,
+    name="files",                # namespaces Redis keys as vtrr:files:*
     celery_queue="vtrr_queue",   # name of the Celery queue workers will consume (separate from the round-robin queue)
     max_concurrency=8,           # cap on dequeue workers queued in the broker at once
 )
@@ -77,6 +78,7 @@ Use a dedicated Redis DB index for the VTRR queue so its keys don't collide with
 |---|---|---|---|
 | `redis_client` | `redis.Redis` | required | Redis client pointed at the VTRR database |
 | `celery_app` | `Celery` | required | Your application's Celery instance |
+| `name` | `str` | required | Unique name for this queue instance; namespaces all Redis keys as `vtrr:{name}:*` |
 | `celery_queue` | `str` | `"vtrr_queue"` | Celery queue name for the dispatcher task |
 | `max_concurrency` | `int` | `4` | Max dequeue workers held in the broker at once |
 
@@ -90,6 +92,25 @@ celery -A myapp worker -Q vtrr_queue --concurrency=8 --loglevel=info
 ```
 
 The `--concurrency` here is the OS-level worker pool size. `max_concurrency` in `VTRRQueue` controls how many dispatcher tasks are *pre-queued* in the broker at once, which is this concurrency value multiplied by the number of worker instances you deploy.
+
+#### One `celery_queue` per `VTRRQueue` instance
+
+Give each `VTRRQueue` instance its own `celery_queue` name. Otherwise, if two or more instances share the same name, the library may under-schedule the celery workers.
+
+```python
+# Good — each queue manages its own worker budget independently
+files_vtrr = VTRRQueue(..., name="files",  celery_queue="vtrr_files",  max_concurrency=8)
+search_vtrr = VTRRQueue(..., name="search", celery_queue="vtrr_search", max_concurrency=4)
+```
+
+Start a worker per queue so you can also size the pools independently:
+
+```
+celery -A myapp worker -Q vtrr_files  --concurrency=8 --loglevel=info
+celery -A myapp worker -Q vtrr_search --concurrency=4 --loglevel=info
+```
+
+If you genuinely want both queues served by a single shared worker pool, you can point both workers at both queues (`-Q vtrr_files,vtrr_search`), but keep the queue names distinct so scheduling counts stay accurate.
 
 
 ### 3. Define tasks
@@ -210,6 +231,7 @@ from vtrr_queue import VTRRQueue
 vtrr = VTRRQueue(
     redis_client=get_redis_connection("vtrr"),  # uses the "vtrr" CACHES entry
     celery_app=celery_app,
+    name="files",
     celery_queue=settings.VTRR_CELERY_SCHEDULER_QUEUE,
     max_concurrency=settings.VTRR_MAX_CONCURRENCY,
 )
@@ -263,14 +285,16 @@ class UploadView(View):
 
 ## Redis keys
 
-The library manages four keys in Redis. These are fixed and not configurable.
+Each `VTRRQueue` instance manages four keys namespaced under `vtrr:{name}:*`.
 
 | Key | Type | Description |
 |---|---|---|
-| `vtrr:queue` | Sorted Set | Task IDs scored by virtual time; lowest score = highest priority |
-| `vtrr:current_virtual_time` | String | Virtual time of the last dequeued task; resets to 0 when queue drains |
-| `vtrr:user_virtual_time` | Hash | Per-user virtual time counter; deleted when queue drains |
-| `vtrr:task` | Hash | `task_id → JSON payload`; deleted when queue drains |
+| `vtrr:{name}:queue` | Sorted Set | Task IDs scored by virtual time; lowest score = highest priority |
+| `vtrr:{name}:current_virtual_time` | String | Virtual time of the last dequeued task; resets to 0 when queue drains |
+| `vtrr:{name}:partition_virtual_time` | Hash | Per-partition virtual time counter; deleted when queue drains |
+| `vtrr:{name}:task` | Hash | `task_id → JSON payload`; deleted when queue drains |
+
+Multiple `VTRRQueue` instances in the same application can safely share a Redis database as long as they have distinct `name` values.
 
 All enqueue and dequeue operations are atomic Lua scripts, so concurrent writers and workers are safe.
 
