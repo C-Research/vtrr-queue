@@ -7,7 +7,7 @@ Integrates with an existing Celery + Redis setup. The library owns the dequeue l
 
 ## Requirements
 
-- Python >= 3.10, <= 3.11.5
+- Python >= 3.12
 - Redis (used for both the VTRR queue state and as the Celery broker)
 - Celery >= 5.0
 
