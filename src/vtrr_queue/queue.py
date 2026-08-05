@@ -15,10 +15,10 @@ _SCRIPTS_DIR = Path(__file__).parent / "scripts"
 _QUEUE_KEY = "vtrr:queue"
 _CURRENT_VT_KEY = "vtrr:current_virtual_time"
 _TASK_LOOKUPS_KEY = "vtrr:task"
-_USERS_VT_KEY = "vtrr:user_virtual_time"
+_PARTITIONS_VT_KEY = "vtrr:partition_virtual_time"
 
-_ENQUEUE_KEYS = [_CURRENT_VT_KEY, _USERS_VT_KEY, _QUEUE_KEY, _TASK_LOOKUPS_KEY]
-_DEQUEUE_KEYS = [_QUEUE_KEY, _CURRENT_VT_KEY, _TASK_LOOKUPS_KEY, _USERS_VT_KEY]
+_ENQUEUE_KEYS = [_CURRENT_VT_KEY, _PARTITIONS_VT_KEY, _QUEUE_KEY, _TASK_LOOKUPS_KEY]
+_DEQUEUE_KEYS = [_QUEUE_KEY, _CURRENT_VT_KEY, _TASK_LOOKUPS_KEY, _PARTITIONS_VT_KEY]
 
 
 class VTRRTask:
@@ -37,30 +37,31 @@ class VTRRTask:
     def name(self) -> str:
         return f"{self.__module__}.{self.__name__}"
 
-    def queue(self, user_id: str, tasks: list[dict[str, Any]]) -> None:
+    def queue(self, partition_key: str, tasks: list[dict[str, Any]]) -> None:
         """
         Bulk-enqueue tasks into the VTRR queue.
 
-        Each entry in `tasks` should contain "args" (list) and/or "kwargs" (dict).
+        Each entry in `tasks` should contain "weight" (int) "args" (list) and/or "kwargs" (dict).
         Celery dequeue workers are scheduled automatically after enqueuing.
 
         Example:
             process_file.queue(
-                user_id="u_123",
+                partition_key="u_123",
                 tasks=[
-                    {"args": ["s3://bucket/a.pdf"], "kwargs": {"force_ocr": True}},
-                    {"args": ["s3://bucket/b.pdf"]},
+                    {"weight": 4, "args": ["s3://bucket/a.pdf"], "kwargs": {"force_ocr": True}},
+                    {"weight": 10, "args": ["s3://bucket/b.pdf"]},
                 ],
             )
         """
-        if not user_id:
-            raise ValueError("user_id is required")
+        if not partition_key:
+            raise ValueError("key_id is required")
         if not tasks:
             return
 
         argv: list[str] = []
         for task in tasks:
             task_id = str(task.get("id", uuid.uuid4()))
+            task_weight = int(task.get("weight", 1))
             payload = json.dumps(
                 {
                     "task_name": self.name,
@@ -68,7 +69,7 @@ class VTRRTask:
                     "kwargs": task.get("kwargs", {}),
                 }
             )
-            argv += [user_id, task_id, payload]
+            argv += [partition_key, task_id, task_weight, payload]
 
         self._vtrr._schedule_workers(len(tasks), self._celery_task)
         self._vtrr._enqueue(argv)

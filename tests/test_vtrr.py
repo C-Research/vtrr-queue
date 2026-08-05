@@ -13,21 +13,21 @@ from vtrr_queue.queue import (
     _ENQUEUE_KEYS,
     _QUEUE_KEY,
     _TASK_LOOKUPS_KEY,
-    _USERS_VT_KEY,
+    _PARTITIONS_VT_KEY,
 )
 
 SCRIPTS_DIR = Path(vtrr_module.__file__).parent / "scripts"
 
 
 def make_argv(task_name, items):
-    """Build flat (user_id, task_id, payload) triples for enqueue.lua.
+    """Build flat (partition_key, task_id, payload) triples for enqueue.lua.
 
-    items: iterable of (user_id, task_id, args, kwargs).
+    items: iterable of (partition_key, task_id, args, kwargs).
     """
     argv = []
-    for user_id, task_id, args, kwargs in items:
+    for partition_key, task_id, args, kwargs in items:
         payload = json.dumps({"task_name": task_name, "args": args, "kwargs": kwargs})
-        argv += [user_id, task_id, payload]
+        argv += [partition_key, task_id, 1, payload]
     return argv
 
 
@@ -69,7 +69,7 @@ class TestRoundRobin:
         )
         scores = redis_client.zrange(_QUEUE_KEY, 0, -1, withscores=True)
         assert scores == [(b"a1", 1.0), (b"a2", 2.0), (b"a3", 3.0)]
-        assert redis_client.hget(_USERS_VT_KEY, "A") == b"3"
+        assert redis_client.hget(_PARTITIONS_VT_KEY, "A") == b"4"
 
     def test_payload_round_trips(self, enqueue_script, dequeue_script):
         enqueue_script(
@@ -138,10 +138,37 @@ class TestRoundRobin:
         dequeue_script(keys=_DEQUEUE_KEYS, args=[])
         assert redis_client.get(_CURRENT_VT_KEY) == b"0"
         assert redis_client.exists(_TASK_LOOKUPS_KEY) == 0
-        assert redis_client.exists(_USERS_VT_KEY) == 0
+        assert redis_client.exists(_PARTITIONS_VT_KEY) == 0
 
     def test_dequeue_empty_queue_returns_empty(self, dequeue_script):
         assert dequeue_script(keys=_DEQUEUE_KEYS, args=[]) == []
+
+    def test_weight_advances_partition_vt_by_weight(self, redis_client, enqueue_script):
+        argv = []
+        for task_id, weight in [("a1", 2), ("a2", 1)]:
+            payload = json.dumps({"task_name": "t", "args": [], "kwargs": {}})
+            argv += ["A", task_id, weight, payload]
+        enqueue_script(keys=_ENQUEUE_KEYS, args=argv)
+        scores = redis_client.zrange(_QUEUE_KEY, 0, -1, withscores=True)
+        # a1 at vt=1, a2 at vt=1+2=3 (not 2)
+        assert scores == [(b"a1", 1.0), (b"a2", 3.0)]
+        # partition_vt = 3 + 1 = 4
+        assert redis_client.hget(_PARTITIONS_VT_KEY, "A") == b"4"
+
+    def test_heavier_weight_yields_more_turns_to_other_partition(
+        self, enqueue_script, dequeue_script
+    ):
+        # A's tasks have weight=2, B's have weight=1.
+        # After draining a1 (vt=1), B gets b1 (vt=1) and b2 (vt=2) before A's a2 (vt=3).
+        argv = []
+        for task_id, weight in [("a1", 2), ("a2", 2)]:
+            payload = json.dumps({"task_name": "t", "args": [], "kwargs": {}})
+            argv += ["A", task_id, weight, payload]
+        for task_id in ["b1", "b2", "b3"]:
+            payload = json.dumps({"task_name": "t", "args": [], "kwargs": {}})
+            argv += ["B", task_id, 1, payload]
+        enqueue_script(keys=_ENQUEUE_KEYS, args=argv)
+        assert drain_all(dequeue_script) == [b"a1", b"b1", b"b2", b"a2", b"b3"]
 
 
 class TestCeleryScheduling:
@@ -189,14 +216,14 @@ class TestCeleryTaskExec:
 
         monkeypatch.setattr(vtrr, "_schedule_workers", lambda *a, **k: None)
         work.queue(
-            user_id="A",
+            partition_key="A",
             tasks=[
                 {"id": "a1", "kwargs": {"tag": "A1"}},
                 {"id": "a2", "kwargs": {"tag": "A2"}},
                 {"id": "a3", "kwargs": {"tag": "A3"}},
             ],
         )
-        work.queue(user_id="B", tasks=[{"id": "b1", "kwargs": {"tag": "B1"}}])
+        work.queue(partition_key="B", tasks=[{"id": "b1", "kwargs": {"tag": "B1"}}])
         kick(work)
         assert ran == ["A1", "B1", "A2", "A3"]
 
@@ -208,7 +235,7 @@ class TestCeleryTaskExec:
             seen.append(n)
 
         monkeypatch.setattr(vtrr, "_schedule_workers", lambda *a, **k: None)
-        work.queue(user_id="A", tasks=[{"kwargs": {"n": i}} for i in range(5)])
+        work.queue(partition_key="A", tasks=[{"kwargs": {"n": i}} for i in range(5)])
         kick(work)
         assert sorted(seen) == [0, 1, 2, 3, 4]
 
@@ -220,7 +247,7 @@ class TestCeleryTaskExec:
             got.append((a, b, c))
 
         monkeypatch.setattr(vtrr, "_schedule_workers", lambda *a, **k: None)
-        work.queue(user_id="A", tasks=[{"args": [1, 2], "kwargs": {"c": 3}}])
+        work.queue(partition_key="A", tasks=[{"args": [1, 2], "kwargs": {"c": 3}}])
         kick(work)
         assert got == [(1, 2, 3)]
 
@@ -254,6 +281,54 @@ class TestCeleryTaskExec:
         assert called_kwargs["kwargs"] == {"is_start": False}
         assert called_kwargs["countdown"] == 3
 
+    def test_weight_accepted_and_alters_drain_order(self, vtrr, monkeypatch):
+        ran = []
+
+        @vtrr.task
+        def work(self, tag):
+            ran.append(tag)
+
+        monkeypatch.setattr(vtrr, "_schedule_workers", lambda *a, **k: None)
+        # a1 weight=3 -> a2 lands at vt=4; b1/b2/b3 land at vt=1/2/3,
+        # so all three B tasks drain before A's second task.
+        work.queue(
+            partition_key="A",
+            tasks=[
+                {"id": "a1", "weight": 3, "kwargs": {"tag": "A1"}},
+                {"id": "a2", "weight": 1, "kwargs": {"tag": "A2"}},
+            ],
+        )
+        work.queue(
+            partition_key="B",
+            tasks=[
+                {"id": "b1", "kwargs": {"tag": "B1"}},
+                {"id": "b2", "kwargs": {"tag": "B2"}},
+                {"id": "b3", "kwargs": {"tag": "B3"}},
+            ],
+        )
+        kick(work)
+        assert ran == ["A1", "B1", "B2", "B3", "A2"]
+
+    def test_default_weight_one_preserves_turn_based_order(self, vtrr, monkeypatch):
+        ran = []
+
+        @vtrr.task
+        def work(self, tag):
+            ran.append(tag)
+
+        monkeypatch.setattr(vtrr, "_schedule_workers", lambda *a, **k: None)
+        # No weight specified — defaults to 1, same as standard fair turn-based order.
+        work.queue(
+            partition_key="A",
+            tasks=[
+                {"id": "a1", "kwargs": {"tag": "A1"}},
+                {"id": "a2", "kwargs": {"tag": "A2"}},
+            ],
+        )
+        work.queue(partition_key="B", tasks=[{"id": "b1", "kwargs": {"tag": "B1"}}])
+        kick(work)
+        assert ran == ["A1", "B1", "A2"]
+
     def test_reschedule_survives_task_exception(self, vtrr, monkeypatch):
         ran = []
 
@@ -265,7 +340,7 @@ class TestCeleryTaskExec:
 
         monkeypatch.setattr(vtrr, "_schedule_workers", lambda *a, **k: None)
         work.queue(
-            user_id="A",
+            partition_key="A",
             tasks=[
                 {"id": "t1", "kwargs": {"tag": "boom"}},
                 {"id": "t2", "kwargs": {"tag": "ok"}},

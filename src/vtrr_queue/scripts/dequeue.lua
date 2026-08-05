@@ -2,7 +2,7 @@
 -- Task info is fetched then deleted from the vtrr:task look-up table. And vtrr:current_virtual_time is
 -- updated to the virutal-time of the dequeued task.
 
--- KEYS: 1=vtrr:queue  2=vtrr:current_virtual_time  3=vtrr:task  4=vtrr:user_virtual_time
+-- KEYS: 1=vtrr:queue  2=vtrr:current_virtual_time  3=vtrr:task  4=vtrr:partition_virtual_time
 local popped = redis.call('ZPOPMIN', KEYS[1])
 if #popped == 0 then
   return {}

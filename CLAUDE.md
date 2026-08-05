@@ -44,9 +44,13 @@ Four fixed keys — do not rename without updating both Lua scripts and the READ
 | `vtrr:user_virtual_time` | Hash: `user_id → virtual_time` |
 | `vtrr:task` | Hash: `task_id → JSON payload` |
 
-JSON payload shape: `{"task_name": str, "task_id": str, "args": list, "kwargs": dict}`
+JSON payload shape: `{"task_name": str, "args": list, "kwargs": dict}`
 
 All four keys are deleted/reset when the queue drains (handled in `dequeue.lua`).
+
+## Task weights
+
+Each task dict passed to `.queue()` may include a `"weight"` key (int, default `1`). Weight controls how much virtual time is consumed after enqueuing that task: a weight of `N` advances the partition's virtual-time counter by `N`, yielding up to `N` turns to other partitions before the next task in this partition is served. Weight `1` is the standard turn-based round-robin.
 
 ## Worker scheduling logic
 

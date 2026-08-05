@@ -128,13 +128,13 @@ Call `.queue()` from anywhere in your application to enqueue the task in the rou
 ```python
 from myapp.tasks import process_file
 
-# Bulk enqueue — all tasks from one user in a single Redis round-trip
+# Bulk enqueue — all tasks from one partition in a single Redis round-trip
 process_file.queue(
-    user_id="u_123",
+    partition_key="u_123",
     tasks=[
-        {"args": ["s3://bucket/a.pdf"], "kwargs": {"dataset_id": "d_1", "force_ocr": True}},
-        {"args": ["s3://bucket/b.pdf"], "kwargs": {"dataset_id": "d_2"}},
-        {"args": ["s3://bucket/c.pdf"], "kwargs": {"dataset_id": "d_3"}},
+        {"weight": 4, "args": ["s3://bucket/a.pdf"], "kwargs": {"dataset_id": "d_1", "force_ocr": True}},
+        {"weight": 2, "args": ["s3://bucket/b.pdf"], "kwargs": {"dataset_id": "d_2"}},
+        {"weight": 2, "args": ["s3://bucket/c.pdf"], "kwargs": {"dataset_id": "d_3"}},
     ],
 )
 ```
@@ -143,10 +143,12 @@ process_file.queue(
 
 | Parameter | Type | Description |
 |---|---|---|
-| `user_id` | `str` | Required. Identifies whose virtual-time slot to use. |
-| `tasks` | `list[dict]` | Required. Each dict has optional `"args"` (list) and `"kwargs"` (dict). |
+| `partition_key` | `str` | Required. Identifies whose virtual-time slot to use. |
+| `tasks` | `list[dict]` | Required. Each dict has optional `"weight"` (int), `"args"` (list), and `"kwargs"` (dict). |
 
 Each task dict may also include an `"id"` key to supply a stable task ID; otherwise a UUID is generated.
+
+`"weight"` defaults to `1`, which gives standard one-turn-per-task round-robin fairness. A weight of `N` advances the partition's virtual time by `N` after that task is enqueued, yielding up to `N` turns to other partitions before the next task in this partition is served. Use higher weights for tasks that are known to be proportionally more expensive.
 
 
 ## Celery task options
@@ -249,9 +251,9 @@ class UploadView(View):
     def post(self, request):
         files = request.FILES.getlist("files")
         process_upload.queue(
-            user_id=str(request.user.id),
+            partition_key=str(request.user.id),
             tasks=[
-                {"args": [f.name], "kwargs": {"dataset_id": request.POST["dataset_id"]}}
+                {"weight": 1, "args": [f.name], "kwargs": {"dataset_id": request.POST["dataset_id"]}}
                 for f in files
             ],
         )
