@@ -13,7 +13,6 @@ logger = logging.getLogger(__name__)
 _SCRIPTS_DIR = Path(__file__).parent / "scripts"
 
 
-
 class VTRRTask:
     def __init__(self, fn: Callable, vtrr: "VTRRQueue", celery_task: Any) -> None:
         self._fn = fn
@@ -121,8 +120,18 @@ class VTRRQueue:
         self._current_vt_key = f"{prefix}:current_virtual_time"
         self._task_key = f"{prefix}:task"
         self._partitions_vt_key = f"{prefix}:partition_virtual_time"
-        self._enqueue_keys = [self._current_vt_key, self._partitions_vt_key, self._queue_key, self._task_key]
-        self._dequeue_keys = [self._queue_key, self._current_vt_key, self._task_key, self._partitions_vt_key]
+        self._enqueue_keys = [
+            self._current_vt_key,
+            self._partitions_vt_key,
+            self._queue_key,
+            self._task_key,
+        ]
+        self._dequeue_keys = [
+            self._queue_key,
+            self._current_vt_key,
+            self._task_key,
+            self._partitions_vt_key,
+        ]
 
         self._enqueue_script = self._load_script("enqueue")
         self._dequeue_script = self._load_script("dequeue")
@@ -139,10 +148,32 @@ class VTRRQueue:
             def my_task(self, task_id, x, y): ...
         """
 
+        _ALLOWED_TASK_OPTIONS = {
+            # execution limits
+            "soft_time_limit",
+            "time_limit",
+            # retry
+            "max_retries",
+            "default_retry_delay",
+            "autoretry_for",
+            "retry_backoff",
+            "retry_backoff_max",
+            "retry_jitter",
+            "retry_kwargs",
+            # base class
+            "base",
+        }
+
         def decorator(f: Callable) -> VTRRTask:
             vtrr = self
+            unsupported_task_options = set(task_options) - _ALLOWED_TASK_OPTIONS
+            if unsupported_task_options:
+                raise TypeError(
+                    f"@vtrr.task does not support option(s): {', '.join(sorted(unsupported_task_options))}. "
+                    f"Allowed: {', '.join(sorted(_ALLOWED_TASK_OPTIONS))}"
+                )
             options = dict(task_options)
-            options.pop("bind", None)  # always bound
+            options.pop("bind", None)
             base = _resolve_base(options.pop("base", None))
             task_name = f"{f.__module__}.{f.__name__}"
 

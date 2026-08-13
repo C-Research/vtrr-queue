@@ -115,7 +115,7 @@ If you genuinely want both queues served by a single shared worker pool, you can
 
 ### 3. Define tasks
 
-Import the `vtrr` instance and decorate functions with `@vtrr.task`. The decorator accepts the same keyword arguments as Celery's `@app.task`:
+Import the `vtrr` instance and decorate functions with `@vtrr.task`. The decorator accepts many of the same keyword arguments as Celery's `@app.task`:
 
 ```python
 # myapp/tasks.py
@@ -127,7 +127,6 @@ from myapp.celery_utils import LogErrorsTask
     base=LogErrorsTask,
     max_retries=3,
     soft_time_limit=3600,
-    acks_late=True,
 )
 def process_file(self, task_id: str, file_key: str, dataset_id: str, force_ocr: bool = False):
     try:
@@ -174,16 +173,20 @@ Each task dict may also include an `"id"` key to supply a stable task ID; otherw
 
 ## Celery task options
 
-`@vtrr.task` accepts the same keyword arguments as `@celery_app.task()`. Common options:
+`@vtrr.task` accepts an explicit subset of `@celery_app.task()` options. Passing anything outside this list raises a `TypeError` at decoration time.
 
 | Option | Description |
 |---|---|
 | `base` | Custom base task class (e.g. for structured error reporting) |
 | `max_retries` | Number of times to retry on exception |
+| `default_retry_delay` | Seconds to wait before retrying (default: 180) |
+| `autoretry_for` | Tuple of exception types to retry on automatically |
+| `retry_backoff` | Enable exponential backoff between retries |
+| `retry_backoff_max` | Cap on backoff delay in seconds |
+| `retry_jitter` | Add random jitter to backoff delays |
 | `retry_kwargs` | Dict of kwargs passed to `self.retry()`, e.g. `{"countdown": 10}` |
 | `soft_time_limit` | Seconds before a `SoftTimeLimitExceeded` is raised in the worker |
 | `time_limit` | Hard kill timeout in seconds |
-| `acks_late` | Only acknowledge the message after the task completes |
 
 Since each `@vtrr.task` becomes its own Celery task, different task functions can have different retry policies and time limits.
 
