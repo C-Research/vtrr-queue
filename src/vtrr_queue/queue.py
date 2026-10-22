@@ -4,6 +4,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 from celery import Task
+from celery.exceptions import Retry
 
 
 import redis as redis_lib
@@ -11,6 +12,10 @@ import redis as redis_lib
 logger = logging.getLogger(__name__)
 
 _SCRIPTS_DIR = Path(__file__).parent / "scripts"
+
+
+def _decode(value: bytes | str) -> str:
+    return value.decode() if isinstance(value, (bytes, bytearray)) else value
 
 
 class VTRRTask:
@@ -99,6 +104,7 @@ def _resolve_base(user_base: type | None) -> type:
 
 class VTRRQueue:
     DEFAULT_MAX_CONCURRENCY = 4
+    DEFAULT_LEASE_SECONDS = 3900
 
     def __init__(
         self,
@@ -108,11 +114,13 @@ class VTRRQueue:
         name: str,
         celery_queue: str = "vtrr_queue",
         max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
     ) -> None:
         self._redis = redis_client
         self._celery_app = celery_app
         self._celery_queue = celery_queue
         self._max_concurrency = max_concurrency
+        self._lease_seconds = lease_seconds
         self._registry: dict[str, VTRRTask] = {}
 
         prefix = f"vtrr:{name}"
@@ -120,21 +128,31 @@ class VTRRQueue:
         self._current_vt_key = f"{prefix}:current_virtual_time"
         self._task_key = f"{prefix}:task"
         self._partitions_vt_key = f"{prefix}:partition_virtual_time"
-        self._enqueue_keys = [
+        self._meta_key = f"{prefix}:meta"
+        self._inflight_key = f"{prefix}:inflight"
+        self._inflight_task_key = f"{prefix}:inflight_task"
+        self._lease_key = f"{prefix}:lease"
+        self._attempts_key = f"{prefix}:attempts"
+        # Every Lua script takes the same KEYS (see scripts/common.lua)
+        self._keys = [
+            self._queue_key,
             self._current_vt_key,
             self._partitions_vt_key,
-            self._queue_key,
             self._task_key,
+            self._meta_key,
+            self._inflight_key,
+            self._inflight_task_key,
+            self._lease_key,
+            self._attempts_key,
         ]
-        self._dequeue_keys = [
-            self._queue_key,
-            self._current_vt_key,
-            self._task_key,
-            self._partitions_vt_key,
-        ]
+        self._enqueue_keys = self._dequeue_keys = self._keys
 
+        self._common_lua = (_SCRIPTS_DIR / "common.lua").read_text()
         self._enqueue_script = self._load_script("enqueue")
         self._dequeue_script = self._load_script("dequeue")
+        self._reclaim_script = self._load_script("reclaim")
+        self._ack_script = self._load_script("ack")
+        self._renew_script = self._load_script("renew")
         self._broker: redis_lib.Redis | None = self._connect_broker()
 
     def task(self, fn: Callable | None = None, **task_options: Any) -> Any:
@@ -160,6 +178,9 @@ class VTRRQueue:
             "retry_backoff_max",
             "retry_jitter",
             "retry_kwargs",
+            # delivery
+            "acks_late",
+            "reject_on_worker_lost",
             # base class
             "base",
         }
@@ -196,21 +217,36 @@ class VTRRQueue:
                                 countdown=3,
                             )
                         return  # queue empty — stop draining, no reschedule
-                    dequeued_name, args, kwargs = result
+                    dequeued_name, args, kwargs, task_id, token, attempt = result
                     task_payload = {
                         "task_name": dequeued_name,
                         "args": args,
                         "kwargs": kwargs,
+                        "attempt": attempt,
+                        "task_id": task_id,
+                        "token": token,
                     }
                 else:
                     dequeued_name = task_payload["task_name"]
                     args = task_payload["args"]
                     kwargs = task_payload["kwargs"]
+                    task_id = task_payload.get("task_id")
+                    token = task_payload.get("token")
+                    if token and not vtrr._renew_lease(task_id, token):
+                        # Lease expired and was reclaimed: the item belongs to another delivery now.
+                        logger.warning(
+                            "vtrr_queue: lease for %s lost before retry — dropping retry",
+                            task_id,
+                        )
+                        return
 
                 # Per-invocation stash (safe under threaded/gevent pools);
                 # retry() reads this to re-run the same item.
                 celery_task.request.vtrr_payload = task_payload
+                # 1 on first delivery; >1 means the item was redelivered after a lost/expired lease
+                celery_task.request.vtrr_attempt = task_payload.get("attempt", 1)
 
+                retrying = False
                 try:
                     registered = vtrr._registry.get(dequeued_name)
                     if registered is None:
@@ -219,7 +255,23 @@ class VTRRQueue:
                         )
                         return
                     registered._fn(celery_task, *args, **kwargs)
+                except Retry:
+                    # Keep the lease: the retry run re-leases it (renew) and acks when done.
+                    retrying = True
+                    raise
                 finally:
+                    if token and not retrying:
+                        # Ack even on failure: only process death / lease expiry redelivers.
+                        # A failed ack just means the item is redelivered after the lease expires.
+                        try:
+                            vtrr.ack(task_id, token)
+                        except Exception as err:
+                            logger.error(
+                                "vtrr_queue: could not ack %s: %s",
+                                task_id,
+                                err,
+                                exc_info=True,
+                            )
                     if dispatched:
                         # In case there's an exception, schedule next dequeue
                         vtrr._schedule_next(celery_task)
@@ -237,7 +289,7 @@ class VTRRQueue:
     # ------------------------------------------------------------------
 
     def _load_script(self, name: str) -> Any:
-        src = (_SCRIPTS_DIR / f"{name}.lua").read_text()
+        src = self._common_lua + (_SCRIPTS_DIR / f"{name}.lua").read_text()
         return self._redis.register_script(src)
 
     def _connect_broker(self) -> redis_lib.Redis | None:
@@ -254,11 +306,18 @@ class VTRRQueue:
     def _enqueue(self, argv: list[str]) -> None:
         self._enqueue_script(keys=self._enqueue_keys, args=argv)
 
-    def _dequeue(self) -> tuple[str, str, list, dict] | None:
-        raw = self._dequeue_script(keys=self._dequeue_keys, args=[])
+    def _dequeue(self) -> tuple[str, list, dict, str, str, int] | None:
+        """Lease the next item: (task_name, args, kwargs, task_id, lease_token, attempt)."""
+        raw = self._dequeue_script(
+            keys=self._dequeue_keys,
+            args=[
+                self._lease_seconds,
+                uuid.uuid4().hex,
+            ],
+        )
         if not raw:
             return None
-        _, payload_bytes = raw
+        task_id, payload_bytes, token, attempt = raw
         if isinstance(payload_bytes, (bytes, bytearray)):
             payload_bytes = payload_bytes.decode()
         payload = json.loads(payload_bytes)
@@ -266,7 +325,34 @@ class VTRRQueue:
             payload["task_name"],
             payload["args"],
             payload["kwargs"],
+            _decode(task_id),
+            _decode(token),
+            int(attempt),
         )
+
+    # ------------------------------------------------------------------
+    # Public: leases
+    # ------------------------------------------------------------------
+
+    def ack(self, task_id: str, token: str) -> bool:
+        """Release a leased item. False (and no change) if the token doesn't match the current lease."""
+        return bool(self._ack_script(keys=self._keys, args=[task_id, token]))
+
+    def _renew_lease(self, task_id: str, token: str) -> bool:
+        """Extend a held lease by `lease_seconds`. False if the token no longer matches."""
+        return bool(
+            self._renew_script(
+                keys=self._keys, args=[task_id, token, self._lease_seconds]
+            )
+        )
+
+    def reclaim(self) -> list[str]:
+        """
+        Re-enqueue (rescored) every item whose lease has expired. Returns the ids that were re-enqueued.
+        Also runs automatically at the start of every dequeue.
+        """
+        ids = self._reclaim_script(keys=self._keys, args=[])
+        return [_decode(i) for i in ids]
 
     # ------------------------------------------------------------------
     # Internal: worker scheduling

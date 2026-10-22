@@ -20,22 +20,26 @@ src/vtrr_queue/
   queue.py          # all logic lives here — single file by design
   py.typed          # PEP 561 marker
   scripts/
+    common.lua      # prelude prepended to every script: vtrr_enqueue (scoring) + vtrr_reclaim
     enqueue.lua     # bulk enqueue, called by VTRRTask.queue()
-    dequeue.lua     # pops one task, called by each @vtrr.task celery wrapper
-tests/              # empty — needs fakeredis-based tests
+    dequeue.lua     # reclaims, then leases one task; called by each @vtrr.task celery wrapper
+    reclaim.lua     # public VTRRQueue.reclaim()
+    ack.lua         # fenced ack of a lease, VTRRQueue.ack()
+    renew.lua       # fenced re-lease used by retry runs, VTRRQueue._renew_lease()
+tests/              # fakeredis-based tests
 ```
 
 ## Key design constraints
 
 - **Single source file** (`queue.py`) — do not split into multiple modules unless the file becomes unmanageable.
 - **No Django dependency** — the library must work with plain Celery + redis-py. Django integration is the consumer's responsibility (`get_redis_connection`, settings wiring, etc.).
-- **No enqueue.lua modification without updating dequeue.lua** — the two scripts share assumptions about key layout and must stay consistent. Both are atomic Lua scripts; never replace them with multi-command Python.
+- **No script modification without checking the others** — the scripts share `common.lua` and assumptions about key layout and must stay consistent. Both are atomic Lua scripts; never replace them with multi-command Python.
 - **`@vtrr.task` IS the Celery task** — the decorator wraps the user function in a Celery task whose body calls `vtrr._dequeue()` then invokes the function directly. One broker hop total; no intermediate dispatcher task.
 - **`celery_queue` is passed explicitly** in every `apply_async` call, bypassing the consumer's `task_routes`.
 
 ## Redis key contract
 
-Each `VTRRQueue` instance namespaces its four keys under `vtrr:{name}:*`. Do not rename without updating both Lua scripts and the README.
+Each `VTRRQueue` instance namespaces its keys under `vtrr:{name}:*`. Do not rename without updating the Lua scripts and the README. Every script receives the same `KEYS` list (order defined in `common.lua`).
 
 | Key | Structure |
 |---|---|
@@ -46,7 +50,7 @@ Each `VTRRQueue` instance namespaces its four keys under `vtrr:{name}:*`. Do not
 
 JSON payload shape: `{"task_name": str, "args": list, "kwargs": dict}`
 
-All four keys are deleted/reset when the queue drains (handled in `dequeue.lua`).
+The first four keys are deleted/reset when the queue drains (handled in `dequeue.lua`). Lease state (`meta`, `inflight`, `inflight_task`, `lease`, `attempts`; see README) is untouched by a drain. Dequeue grants a lease rather than deleting the item; reclaim rescores expired items through the same `vtrr_enqueue` function a fresh enqueue uses — never duplicate that logic.
 
 ## Task weights
 
