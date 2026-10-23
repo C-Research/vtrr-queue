@@ -35,6 +35,7 @@ tests/              # fakeredis-based tests
 - **No Django dependency** — the library must work with plain Celery + redis-py. Django integration is the consumer's responsibility (`get_redis_connection`, settings wiring, etc.).
 - **No script modification without checking the others** — the scripts share `common.lua` and assumptions about key layout and must stay consistent. Both are atomic Lua scripts; never replace them with multi-command Python.
 - **`@vtrr.task` IS the Celery task** — the decorator wraps the user function in a Celery task whose body calls `vtrr._dequeue()` then invokes the function directly. One broker hop total; no intermediate dispatcher task.
+- **One task per `VTRRQueue`** — `@vtrr.task` raises `ValueError` for a second function. Triggers are interchangeable and run whatever item they dequeue, so a mixed queue would run items under the wrong task's Celery options. `vtrr._task` is the single registered task; the item payload's `task_name` is checked against it.
 - **`celery_queue` is passed explicitly** in every `apply_async` call, bypassing the consumer's `task_routes`.
 
 ## Redis key contract
@@ -59,6 +60,10 @@ Each task dict passed to `.queue()` may include a `"weight"` key (int, default `
 ## Worker scheduling logic
 
 `_schedule_workers(num_tasks)` schedules `min(max_concurrency - workers_scheduled, num_tasks)` Celery tasks after every `.queue()` call. `_get_workers_scheduled()` counts broker list lengths across Celery's four Redis priority suffixes (`""`, `":3"`, `":6"`, `":9"`). It returns `0` on any error so scheduling may over-fire slightly — this is intentional and safe.
+
+## Periodic reclaim
+
+Recovery of work from dead workers must not depend on Celery's `acks_late` / `reject_on_worker_lost` (they stay allowed task options but the library never requires them). Trigger messages carry no payload, so a lost trigger loses nothing; `reclaim_and_dispatch()` (reclaim expired leases, then `_schedule_workers(zcard(queue))` using any registered task as the trigger) is what wakes workers back up. With `reclaim_interval` set, the constructor registers the `vtrr_queue.reclaim.{name}` Celery task and merges its entry into `celery_app.conf.beat_schedule`; `beat_schedule()` returns the entry for apps that assign the schedule wholesale.
 
 ## Development setup
 

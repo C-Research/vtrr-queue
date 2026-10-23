@@ -115,13 +115,21 @@ class VTRRQueue:
         celery_queue: str = "vtrr_queue",
         max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
+        reclaim_interval: float | None = None,
+        reclaim_queue: str | None = None,
     ) -> None:
+        if reclaim_interval is not None and reclaim_interval <= 0:
+            raise ValueError("reclaim_interval must be a positive number of seconds")
         self._redis = redis_client
         self._celery_app = celery_app
         self._celery_queue = celery_queue
         self._max_concurrency = max_concurrency
         self._lease_seconds = lease_seconds
-        self._registry: dict[str, VTRRTask] = {}
+        self._reclaim_interval = reclaim_interval
+        self._reclaim_queue = reclaim_queue
+        self._reclaim_task_name = f"vtrr_queue.reclaim.{name}"
+        self._name = name
+        self._task: VTRRTask | None = None
 
         prefix = f"vtrr:{name}"
         self._queue_key = f"{prefix}:queue"
@@ -155,9 +163,15 @@ class VTRRQueue:
         self._renew_script = self._load_script("renew")
         self._broker: redis_lib.Redis | None = self._connect_broker()
 
+        if reclaim_interval is not None:
+            self._register_reclaim_task()
+
     def task(self, fn: Callable | None = None, **task_options: Any) -> Any:
         """
         Decorator that registers a function as a VTRR-dispatchable Celery task.
+
+        A VTRRQueue runs exactly one task: decorating a second function raises ValueError. Use one
+        VTRRQueue (with its own `name` and `celery_queue`) per task.
 
         The first argument is always `self` (the bound Celery task), then any args/kwargs from .queue():
 
@@ -187,6 +201,15 @@ class VTRRQueue:
 
         def decorator(f: Callable) -> VTRRTask:
             vtrr = self
+            # Re-decorating the same function (e.g. a module reload) just replaces it
+            if (
+                self._task is not None
+                and self._task.name != f"{f.__module__}.{f.__name__}"
+            ):
+                raise ValueError(
+                    f"VTRRQueue {self._name!r} already runs task {self._task.name!r}; "
+                    f"create a separate VTRRQueue to register {f.__module__}.{f.__name__}"
+                )
             unsupported_task_options = set(task_options) - _ALLOWED_TASK_OPTIONS
             if unsupported_task_options:
                 raise TypeError(
@@ -248,10 +271,12 @@ class VTRRQueue:
 
                 retrying = False
                 try:
-                    registered = vtrr._registry.get(dequeued_name)
-                    if registered is None:
+                    registered = vtrr._task
+                    if registered is None or registered.name != dequeued_name:
                         logger.error(
-                            "vtrr_queue: unknown task %r — dropped", dequeued_name
+                            "vtrr_queue: item for task %r does not match this queue's task %r — dropped",
+                            dequeued_name,
+                            registered.name if registered else None,
                         )
                         return
                     registered._fn(celery_task, *args, **kwargs)
@@ -277,7 +302,7 @@ class VTRRQueue:
                         vtrr._schedule_next(celery_task)
 
             wrapped = VTRRTask(f, self, celery_wrapper)
-            self._registry[wrapped.name] = wrapped
+            self._task = wrapped
             return wrapped
 
         if fn is not None:
@@ -353,6 +378,67 @@ class VTRRQueue:
         """
         ids = self._reclaim_script(keys=self._keys, args=[])
         return [_decode(i) for i in ids]
+
+    def reclaim_and_dispatch(self) -> list[str]:
+        """
+        Reclaim expired leases.
+        If a worker silently fails (OOM, restarts, etc) it may silently drop the item it was working on.
+        Reclaim will check if the lease on that item has expired, then dispatch a new worker on it.
+
+        Returns the ids that were re-enqueued.
+        """
+        # Reclaim expired leases
+        reclaimed = self.reclaim()
+
+        # Refresh/saturate scheduled workers if there are items in the queue.
+        try:
+            waiting = int(self._redis.zcard(self._queue_key))
+        except Exception as err:
+            logger.error(
+                "vtrr_queue: could not read queue length: %s", err, exc_info=True
+            )
+            return reclaimed
+        if waiting:
+            if self._task is None:
+                logger.error(
+                    "vtrr_queue: %d item(s) waiting but no @vtrr.task is registered in this process",
+                    waiting,
+                )
+            else:
+                self._schedule_workers(waiting, self._task._celery_task)
+        return reclaimed
+
+    def reclaim_beat_schedule(self) -> dict[str, dict[str, Any]]:
+        """
+        The Celery Beat entry for periodic reclaim, or {} if `reclaim_interval` is unset.
+
+        Merged into `celery_app.conf.beat_schedule` automatically at construction. Use this to
+        re-add it if your app assigns `beat_schedule` wholesale after creating the VTRRQueue:
+
+            app.conf.beat_schedule = {**my_entries, **vtrr.reclaim_beat_schedule()}
+        """
+        if self._reclaim_interval is None:
+            return {}
+        entry: dict[str, Any] = {
+            "task": self._reclaim_task_name,
+            "schedule": float(self._reclaim_interval),
+        }
+        if self._reclaim_queue:
+            entry["options"] = {"queue": self._reclaim_queue}
+        return {self._reclaim_task_name: entry}
+
+    def _register_reclaim_task(self) -> None:
+        # shared=False: bind to this app only. Celery's default shares the task with every
+        # app finalized later in the process, which would run it against this queue's closure.
+        @self._celery_app.task(
+            name=self._reclaim_task_name, ignore_result=True, shared=False
+        )
+        def reclaim_task() -> None:
+            self.reclaim_and_dispatch()
+
+        schedule = dict(self._celery_app.conf.beat_schedule or {})
+        schedule.update(self.reclaim_beat_schedule())
+        self._celery_app.conf.beat_schedule = schedule
 
     # ------------------------------------------------------------------
     # Internal: worker scheduling

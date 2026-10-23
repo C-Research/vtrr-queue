@@ -581,3 +581,152 @@ class TestRetryReleasesLease:
         payload = {"task_name": work.name, "args": [], "kwargs": {}, "task_id": "t1", "token": "stale"}
         work._celery_task.apply(kwargs={"task_payload": payload})
         assert ran == []
+
+
+class TestReclaimAndDispatch:
+    def test_reclaims_expired_lease_and_schedules_a_trigger(
+        self, vtrr, enqueue_script, monkeypatch
+    ):
+        @vtrr.task
+        def work(self):
+            pass
+
+        enqueue_script(make_argv(work.name, [("A", "a1", [], {})]))
+        lease(vtrr)
+        expire(vtrr, "a1")
+        scheduled = []
+        monkeypatch.setattr(vtrr, "_schedule_workers", lambda n, t: scheduled.append((n, t)))
+
+        assert vtrr.reclaim_and_dispatch() == ["a1"]
+        assert scheduled == [(1, work._celery_task)]
+
+    def test_tops_up_triggers_for_an_idle_queue_with_nothing_reclaimed(
+        self, vtrr, enqueue_script, monkeypatch
+    ):
+        # e.g. every trigger was lost: items are waiting but no worker will ever wake up
+        @vtrr.task
+        def work(self):
+            pass
+
+        enqueue_script(make_argv(work.name, [("A", "a1", [], {}), ("A", "a2", [], {})]))
+        scheduled = []
+        monkeypatch.setattr(vtrr, "_schedule_workers", lambda n, t: scheduled.append(n))
+
+        assert vtrr.reclaim_and_dispatch() == []
+        assert scheduled == [2]
+
+    def test_noop_when_nothing_waiting(self, vtrr, monkeypatch):
+        @vtrr.task
+        def work(self):
+            pass
+
+        scheduled = []
+        monkeypatch.setattr(vtrr, "_schedule_workers", lambda n, t: scheduled.append(n))
+        assert vtrr.reclaim_and_dispatch() == []
+        assert scheduled == []
+
+    def test_unexpired_lease_is_left_alone(self, vtrr, enqueue_script):
+        @vtrr.task
+        def work(self):
+            pass
+
+        enqueue_script(make_argv(work.name, [("A", "a1", [], {})]))
+        lease(vtrr)
+        assert vtrr.reclaim_and_dispatch() == []
+        assert vtrr._redis.zscore(vtrr._inflight_key, "a1") is not None
+
+    def test_no_registered_task_does_not_raise(self, vtrr, enqueue_script):
+        enqueue_script(make_argv("t", [("A", "a1", [], {})]))
+        assert vtrr.reclaim_and_dispatch() == []
+
+
+class TestReclaimSchedule:
+    def test_disabled_by_default(self, vtrr, celery_app):
+        assert vtrr.beat_schedule() == {}
+        assert not celery_app.conf.beat_schedule
+        assert "vtrr_queue.reclaim.test" not in celery_app.tasks
+
+    def test_enabled_registers_task_and_beat_entry(self, redis_client, celery_app):
+        celery_app.conf.beat_schedule = {"existing": {"task": "x", "schedule": 1.0}}
+        q = VTRRQueue(
+            redis_client=redis_client,
+            celery_app=celery_app,
+            name="test",
+            reclaim_interval=600,
+            reclaim_queue="other",
+        )
+        entry = celery_app.conf.beat_schedule["vtrr_queue.reclaim.test"]
+        assert entry == {
+            "task": "vtrr_queue.reclaim.test",
+            "schedule": 600.0,
+            "options": {"queue": "other"},
+        }
+        assert "existing" in celery_app.conf.beat_schedule  # merged, not replaced
+        assert q.reclaim_beat_schedule() == {"vtrr_queue.reclaim.test": entry}
+        assert "vtrr_queue.reclaim.test" in celery_app.tasks
+
+    def test_queue_option_omitted_when_unset(self, redis_client, celery_app):
+        q = VTRRQueue(
+            redis_client=redis_client, celery_app=celery_app, name="test", reclaim_interval=60
+        )
+        assert "options" not in q.reclaim_beat_schedule()["vtrr_queue.reclaim.test"]
+
+    def test_registered_celery_task_runs_reclaim_and_dispatch(
+        self, redis_client, celery_app, monkeypatch
+    ):
+        q = VTRRQueue(
+            redis_client=redis_client, celery_app=celery_app, name="test", reclaim_interval=60
+        )
+        called = []
+        monkeypatch.setattr(q, "reclaim_and_dispatch", lambda: called.append(1))
+        celery_app.tasks["vtrr_queue.reclaim.test"].apply()
+        assert called == [1]
+
+    @pytest.mark.parametrize("interval", [0, -5])
+    def test_rejects_non_positive_interval(self, redis_client, celery_app, interval):
+        with pytest.raises(ValueError):
+            VTRRQueue(
+                redis_client=redis_client,
+                celery_app=celery_app,
+                name="test",
+                reclaim_interval=interval,
+            )
+
+
+class TestSingleTask:
+    def test_second_task_on_same_queue_is_rejected(self, vtrr):
+        @vtrr.task
+        def first(self):
+            pass
+
+        with pytest.raises(ValueError, match="already runs task"):
+
+            @vtrr.task
+            def second(self):
+                pass
+
+        assert vtrr._task is first
+
+    def test_redecorating_same_function_replaces_it(self, vtrr):
+        def make():
+            @vtrr.task
+            def work(self):
+                pass
+
+            return work
+
+        first, second = make(), make()
+        assert first.name == second.name
+        assert vtrr._task is second
+
+    def test_item_for_a_different_task_is_dropped_not_run(self, vtrr, enqueue_script):
+        ran = []
+
+        @vtrr.task
+        def work(self):
+            ran.append(1)
+
+        enqueue_script(make_argv("somewhere.else", [("A", "a1", [], {})]))
+        work._celery_task.apply(kwargs={"is_start": False})
+        assert ran == []
+        assert vtrr._redis.zcard(vtrr._inflight_key) == 0  # acked, not left leased
