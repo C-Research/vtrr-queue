@@ -420,9 +420,9 @@ class TestCeleryTaskExec:
 
 
 def lease(vtrr):
-    """Dequeue via the real path; returns (task_id, token, attempt)."""
-    _, _, _, task_id, token, attempt = vtrr._dequeue()
-    return task_id, token, attempt
+    """Dequeue via the real path; returns (task_id, token, timeouts)."""
+    _, _, _, task_id, token, timeouts = vtrr._dequeue()
+    return task_id, token, timeouts
 
 
 def expire(vtrr, task_id):
@@ -435,8 +435,8 @@ class TestLeases:
         self, vtrr, redis_client, enqueue_script
     ):
         enqueue_script(make_argv("t", [("A", "a1", [], {})]))
-        task_id, token, attempt = lease(vtrr)
-        assert (task_id, attempt) == ("a1", 1)
+        task_id, token, timeouts = lease(vtrr)
+        assert (task_id, timeouts) == ("a1", 0)
         assert redis_client.zscore(vtrr._inflight_key, "a1") > 0
         assert redis_client.hget(vtrr._lease_key, "a1") == token.encode()
 
@@ -445,7 +445,7 @@ class TestLeases:
             vtrr._inflight_key,
             vtrr._inflight_task_key,
             vtrr._lease_key,
-            vtrr._attempts_key,
+            vtrr._timeouts_key,
             vtrr._meta_key,
         ):
             assert redis_client.exists(key) == 0
@@ -456,8 +456,8 @@ class TestLeases:
         enqueue_script(make_argv("t", [("A", "a1", [], {})]))
         _, old_token, _ = lease(vtrr)
         expire(vtrr, "a1")
-        _, new_token, attempt = lease(vtrr)  # reclaimed and re-granted
-        assert attempt == 2 and new_token != old_token
+        _, new_token, timeouts = lease(vtrr)  # reclaimed and re-granted
+        assert timeouts == 1 and new_token != old_token
 
         before = redis_client.zscore(vtrr._inflight_key, "a1")
         assert vtrr.ack("a1", old_token) is False  # stale holder
@@ -465,7 +465,7 @@ class TestLeases:
         assert vtrr.ack("missing", old_token) is False
         assert redis_client.zscore(vtrr._inflight_key, "a1") == before
         assert redis_client.hget(vtrr._lease_key, "a1") == new_token.encode()
-        assert redis_client.hget(vtrr._attempts_key, "a1") == b"2"
+        assert redis_client.hget(vtrr._timeouts_key, "a1") == b"1"
 
     def test_lease_expiry_uses_redis_time_plus_lease_seconds(self, vtrr, redis_client, enqueue_script):
         enqueue_script(make_argv("t", [("A", "a1", [], {})]))
@@ -495,15 +495,15 @@ class TestLeases:
         assert redis_client.zscore(vtrr._inflight_key, "a1") is None
         assert lease(vtrr)[0] == "a1"  # redelivered with its original payload
 
-    def test_attempts_persist_across_reclaims(self, vtrr, redis_client, enqueue_script):
+    def test_timeouts_count_reclaims_and_persist(self, vtrr, redis_client, enqueue_script):
         enqueue_script(make_argv("t", [("A", "a1", [], {})]))
-        assert lease(vtrr)[2] == 1
+        assert lease(vtrr)[2] == 0  # first dequeue is not a timeout
         expire(vtrr, "a1")
-        assert lease(vtrr)[2] == 2  # attempt counter survived the reclaim
+        assert lease(vtrr)[2] == 1  # one lease expired and was reclaimed
         expire(vtrr, "a1")
         assert vtrr.reclaim() == ["a1"]
-        assert redis_client.hget(vtrr._attempts_key, "a1") == b"2"
-        assert lease(vtrr)[2] == 3
+        assert redis_client.hget(vtrr._timeouts_key, "a1") == b"2"
+        assert lease(vtrr)[2] == 2
 
     def test_standalone_reclaim_only_takes_expired(self, vtrr, redis_client, enqueue_script):
         enqueue_script(make_argv("t", [("A", "a1", [], {}), ("B", "b1", [], {})]))
@@ -526,17 +526,17 @@ class TestLeases:
             kick(work)
         assert vtrr._redis.zcard(vtrr._inflight_key) == 0  # acked in finally
 
-    def test_attempt_is_visible_to_task(self, vtrr, monkeypatch):
+    def test_timeouts_is_visible_to_task(self, vtrr, monkeypatch):
         seen = []
 
         @vtrr.task
         def work(self):
-            seen.append(self.request.vtrr_attempt)
+            seen.append(self.request.vtrr_timeouts)
 
         monkeypatch.setattr(vtrr, "_schedule_workers", lambda *a, **k: None)
         work.queue(partition_key="A", tasks=[{"id": "t1"}])
         kick(work)
-        assert seen == [1]
+        assert seen == [0]
 
 
 class TestRetryReleasesLease:
@@ -642,7 +642,7 @@ class TestReclaimAndDispatch:
 
 class TestReclaimSchedule:
     def test_disabled_by_default(self, vtrr, celery_app):
-        assert vtrr.beat_schedule() == {}
+        assert vtrr.reclaim_beat_schedule() == {}
         assert not celery_app.conf.beat_schedule
         assert "vtrr_queue.reclaim.test" not in celery_app.tasks
 

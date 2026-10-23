@@ -7,6 +7,6 @@ end
 redis.call('ZREM', INFLIGHT, ARGV[1])
 redis.call('HDEL', INFLIGHT_TASK, ARGV[1])
 redis.call('HDEL', LEASE, ARGV[1])
-redis.call('HDEL', ATTEMPTS, ARGV[1])
+redis.call('HDEL', TIMEOUTS, ARGV[1])
 redis.call('HDEL', META, ARGV[1])
 return 1

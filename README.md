@@ -294,14 +294,14 @@ class UploadView(View):
 
 ## Leasing and at-least-once delivery
 
-Dequeuing an item does not delete it; it **leases** it. The item moves to an in-flight set with an expiry of `redis_time + lease_seconds` (Redis `TIME`, so worker clock skew is irrelevant) and its attempt counter is incremented. The `@vtrr.task` wrapper acks the lease when your function returns. If the worker dies first, the lease expires and the next dequeue (or a call to `vtrr.reclaim()`, or the [periodic reclaim](#periodic-reclaim-with-celery-beat)) puts the item back in the queue, **rescored** under VTRR as if freshly enqueued; it does not keep its old position. The attempt counter is not reset.
+Dequeuing an item does not delete it; it **leases** it. The item moves to an in-flight set with an expiry of `redis_time + lease_seconds` (Redis `TIME`, so worker clock skew is irrelevant) and its lease token is stored. The `@vtrr.task` wrapper acks the lease when your function returns. If the worker dies first, the lease expires and the next dequeue (or a call to `vtrr.reclaim()`, or the [periodic reclaim](#periodic-reclaim-with-celery-beat)) puts the item back in the queue, **rescored** under VTRR as if freshly enqueued; it does not keep its old position. Each reclaim adds one to the item's **timeouts** count, which is never reset.
 
-Delivery is therefore **at-least-once: task bodies must be idempotent.** Inside a task, `self.request.vtrr_attempt` is the delivery number (1 on the first delivery). The library does not cap attempts; your task decides when to give up (see [Attempt limits](#attempt-limits)).
+Delivery is therefore **at-least-once: task bodies must be idempotent.** Inside a task, `self.request.vtrr_timeouts` is how many times this item's lease has expired and been reclaimed: 0 on the first run, +1 each time it is run again after a timeout. The library does not cap timeouts; your task decides when to give up (see [Timeout limits](#timeout-limits)).
 
 The wrapper acks in a `finally`, so a Python exception does not redeliver forever; only process death or lease expiry does. This matches Celery's default `task_acks_on_failure_or_timeout=True`. If you use the low-level API directly:
 
 ```python
-task_name, args, kwargs, task_id, token, attempt = vtrr._dequeue()
+task_name, args, kwargs, task_id, token, timeouts = vtrr._dequeue()
 try:
     ...
 finally:
@@ -350,23 +350,23 @@ vtrr = VTRRQueue(..., reclaim_interval=600, reclaim_queue="celery")
 At construction the library registers a task named `vtrr_queue.reclaim.{name}` and merges its entry into `celery_app.conf.beat_schedule`. You still have to run Beat (`celery -A myapp beat`), and the process that executes the task must have imported your `@vtrr.task` functions, which it uses as triggers.
 
 - **`reclaim_queue`**: leave it unset to use your default Celery queue, or name a queue that some worker consumes. Don't send it to `celery_queue` if those workers are usually busy with long tasks; it would wait behind them.
-- **If your app assigns `beat_schedule` wholesale after creating the `VTRRQueue`**, it overwrites the entry. Merge `vtrr.beat_schedule()` back in:
+- **If your app assigns `beat_schedule` wholesale after creating the `VTRRQueue`**, it overwrites the entry. Merge `vtrr.reclaim_beat_schedule()` back in:
 
   ```python
-  app.conf.beat_schedule = {**my_entries, **vtrr.beat_schedule()}
+  app.conf.beat_schedule = {**my_entries, **vtrr.reclaim_beat_schedule()}
   ```
 - **Without Beat**, call `vtrr.reclaim_and_dispatch()` from whatever scheduler you have (cron, a management command, etc.).
 
-### Attempt limits
+### Timeout limits
 
-The library never gives up on an item: every expired lease is reclaimed and re-enqueued. To cap redeliveries, check the attempt number in your task and return early; the wrapper then acks the item and it is dropped.
+The library never gives up on an item: every expired lease is reclaimed and re-enqueued. To cap redeliveries, check the timeouts count in your task and return early; the wrapper then acks the item and it is dropped.
 
 ```python
-MAX_ATTEMPTS = 3
+MAX_TIMEOUTS = 3
 
 @vtrr.task(soft_time_limit=3600, time_limit=3720)
 def process_file(self, ...):
-    if self.request.vtrr_attempt > MAX_ATTEMPTS:
+    if self.request.vtrr_timeouts >= MAX_TIMEOUTS:
         log_poison_item(...)   # your own dead-letter handling
         return
     ...
@@ -387,7 +387,7 @@ Each `VTRRQueue` instance manages these keys, namespaced under `vtrr:{name}:*`.
 | `vtrr:{name}:inflight` | Sorted Set | Leased task IDs scored by lease expiry (Redis time) |
 | `vtrr:{name}:inflight_task` | Hash | `task_id → JSON payload` for leased items |
 | `vtrr:{name}:lease` | Hash | `task_id → lease token` |
-| `vtrr:{name}:attempts` | Hash | `task_id → delivery count`; cleared on ack |
+| `vtrr:{name}:timeouts` | Hash | `task_id → times its lease expired and was reclaimed`; cleared on ack |
 
 Multiple `VTRRQueue` instances in the same application can safely share a Redis database as long as they have distinct `name` values.
 

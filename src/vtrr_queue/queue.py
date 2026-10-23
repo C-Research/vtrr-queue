@@ -140,7 +140,7 @@ class VTRRQueue:
         self._inflight_key = f"{prefix}:inflight"
         self._inflight_task_key = f"{prefix}:inflight_task"
         self._lease_key = f"{prefix}:lease"
-        self._attempts_key = f"{prefix}:attempts"
+        self._timeouts_key = f"{prefix}:timeouts"
         # Every Lua script takes the same KEYS (see scripts/common.lua)
         self._keys = [
             self._queue_key,
@@ -151,7 +151,7 @@ class VTRRQueue:
             self._inflight_key,
             self._inflight_task_key,
             self._lease_key,
-            self._attempts_key,
+            self._timeouts_key,
         ]
         self._enqueue_keys = self._dequeue_keys = self._keys
 
@@ -240,12 +240,12 @@ class VTRRQueue:
                                 countdown=3,
                             )
                         return  # queue empty — stop draining, no reschedule
-                    dequeued_name, args, kwargs, task_id, token, attempt = result
+                    dequeued_name, args, kwargs, task_id, token, timeouts = result
                     task_payload = {
                         "task_name": dequeued_name,
                         "args": args,
                         "kwargs": kwargs,
-                        "attempt": attempt,
+                        "timeouts": timeouts,
                         "task_id": task_id,
                         "token": token,
                     }
@@ -256,7 +256,7 @@ class VTRRQueue:
                     task_id = task_payload.get("task_id")
                     token = task_payload.get("token")
                     if token and not vtrr._renew_lease(task_id, token):
-                        # Lease expired and was reclaimed: the item belongs to another delivery now.
+                        # Lease expired and was reclaimed: the item belongs to another run now.
                         logger.warning(
                             "vtrr_queue: lease for %s lost before retry — dropping retry",
                             task_id,
@@ -266,8 +266,8 @@ class VTRRQueue:
                 # Per-invocation stash (safe under threaded/gevent pools);
                 # retry() reads this to re-run the same item.
                 celery_task.request.vtrr_payload = task_payload
-                # 1 on first delivery; >1 means the item was redelivered after a lost/expired lease
-                celery_task.request.vtrr_attempt = task_payload.get("attempt", 1)
+                # 0 on the first run; +1 each time the item's lease expired and it was reclaimed
+                celery_task.request.vtrr_timeouts = task_payload.get("timeouts", 0)
 
                 retrying = False
                 try:
@@ -332,7 +332,7 @@ class VTRRQueue:
         self._enqueue_script(keys=self._enqueue_keys, args=argv)
 
     def _dequeue(self) -> tuple[str, list, dict, str, str, int] | None:
-        """Lease the next item: (task_name, args, kwargs, task_id, lease_token, attempt)."""
+        """Lease the next item: (task_name, args, kwargs, task_id, lease_token, timeouts)."""
         raw = self._dequeue_script(
             keys=self._dequeue_keys,
             args=[
@@ -342,7 +342,7 @@ class VTRRQueue:
         )
         if not raw:
             return None
-        task_id, payload_bytes, token, attempt = raw
+        task_id, payload_bytes, token, timeouts = raw
         if isinstance(payload_bytes, (bytes, bytearray)):
             payload_bytes = payload_bytes.decode()
         payload = json.loads(payload_bytes)
@@ -352,7 +352,7 @@ class VTRRQueue:
             payload["kwargs"],
             _decode(task_id),
             _decode(token),
-            int(attempt),
+            int(timeouts),
         )
 
     # ------------------------------------------------------------------

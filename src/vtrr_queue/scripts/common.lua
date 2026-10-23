@@ -1,9 +1,9 @@
 -- KEYS: 1=vtrr:queue  2=vtrr:current_virtual_time  3=vtrr:partition_virtual_time  4=vtrr:task
---       5=vtrr:meta  6=vtrr:inflight  7=vtrr:inflight_task  8=vtrr:lease  9=vtrr:attempts
+--       5=vtrr:meta  6=vtrr:inflight  7=vtrr:inflight_task  8=vtrr:lease  9=vtrr:timeouts
 local QUEUE, CURRENT_VT, PARTITION_VT, TASK = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
-local META, INFLIGHT, INFLIGHT_TASK, LEASE, ATTEMPTS = KEYS[5], KEYS[6], KEYS[7], KEYS[8], KEYS[9]
+local META, INFLIGHT, INFLIGHT_TASK, LEASE, TIMEOUTS = KEYS[5], KEYS[6], KEYS[7], KEYS[8], KEYS[9]
 
--- Redis server time in seconds. Never trust a client clock.
+-- Redis server time in seconds.
 local function redis_now()
   local t = redis.call('TIME')
   return tonumber(t[1]) + tonumber(t[2]) / 1000000
@@ -34,7 +34,8 @@ local function vtrr_enqueue(items)
 end
 
 -- Move all expired in-flight items back into the queue (rescored via vtrr_enqueue).
--- The attempt counter is never reset. Returns the ids that were re-enqueued.
+-- Each reclaim is one timeout for the item: its timeouts counter is incremented here and never reset.
+-- Returns the ids that were re-enqueued.
 local function vtrr_reclaim(now)
   local expired = redis.call('ZRANGEBYSCORE', INFLIGHT, '-inf', string.format('%.3f', now))
   local items, ids = {}, {}
@@ -43,6 +44,7 @@ local function vtrr_reclaim(now)
     redis.call('ZREM', INFLIGHT, task_id)
     redis.call('HDEL', INFLIGHT_TASK, task_id)
     redis.call('HDEL', LEASE, task_id)
+    redis.call('HINCRBY', TIMEOUTS, task_id, 1)
     local weight, partition_key = string.match(redis.call('HGET', META, task_id), '^(%d+):(.*)$')
     items[#items + 1] = {partition_key, task_id, tonumber(weight), payload}
     ids[#ids + 1] = task_id

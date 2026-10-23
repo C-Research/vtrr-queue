@@ -1,11 +1,11 @@
 -- Dequeue a task with the smallest virtual-time from the virutal time round-robin queue (vtrr:queue) and lease it.
 -- Expired leases are reclaimed first. The task payload moves from vtrr:task to vtrr:inflight_task, the task is
--- added to vtrr:inflight scored by (redis time + lease_seconds), its attempt counter is incremented and its lease
--- token stored. vtrr:current_virtual_time is updated to the virutal-time of the dequeued task.
+-- added to vtrr:inflight scored by (redis time + lease_seconds) and its lease token stored. The item's timeouts count
+-- (how many times its lease expired and it was reclaimed; 0 on the first dequeue) is returned unchanged. vtrr:current_virtual_time is updated to the virutal-time of the dequeued task.
 -- The caller must ack (ack.lua) with the returned token when done.
 
 -- ARGV: 1=lease_seconds  2=lease_token
--- Returns {task_id, task, token, attempt}, or {} if the queue is empty.
+-- Returns {task_id, task, token, timeouts}, or {} if the queue is empty.
 local now = redis_now()
 vtrr_reclaim(now)
 
@@ -27,9 +27,9 @@ else
   redis.call('SET', CURRENT_VT, task_virtual_time)
 end
 
-local attempt = redis.call('HINCRBY', ATTEMPTS, task_id, 1)
+local timeouts = tonumber(redis.call('HGET', TIMEOUTS, task_id) or '0')
 redis.call('ZADD', INFLIGHT, string.format('%.3f', now + tonumber(ARGV[1])), task_id)
 redis.call('HSET', INFLIGHT_TASK, task_id, task)
 redis.call('HSET', LEASE, task_id, ARGV[2])
 
-return {task_id, task, ARGV[2], attempt}
+return {task_id, task, ARGV[2], timeouts}
