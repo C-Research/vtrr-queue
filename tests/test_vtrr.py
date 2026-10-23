@@ -32,8 +32,11 @@ def enqueue_script(vtrr):
 
 @pytest.fixture
 def dequeue_script(vtrr):
-    """Bound dequeue callable — no arguments needed."""
-    return lambda: vtrr._dequeue_script(keys=vtrr._dequeue_keys, args=[])
+    """Bound dequeue callable — returns [task_id, payload] (or []), dropping lease details."""
+    return lambda: vtrr._dequeue_script(
+        keys=vtrr._dequeue_keys,
+        args=[vtrr._lease_seconds, "tok"],
+    )[:2]
 
 
 def drain_all(dequeue_script):
@@ -121,7 +124,9 @@ class TestRoundRobin:
         dequeue_script()  # pops a1 (vt 1); queue not empty
         assert float(redis_client.get(vtrr._current_vt_key)) == 1.0
 
-    def test_drain_resets_all_state(self, vtrr, redis_client, enqueue_script, dequeue_script):
+    def test_drain_resets_all_state(
+        self, vtrr, redis_client, enqueue_script, dequeue_script
+    ):
         enqueue_script(make_argv("t", [("A", "a1", [], {})]))
         dequeue_script()
         assert redis_client.get(vtrr._current_vt_key) == b"0"
@@ -131,7 +136,9 @@ class TestRoundRobin:
     def test_dequeue_empty_queue_returns_empty(self, dequeue_script):
         assert dequeue_script() == []
 
-    def test_weight_advances_partition_vt_by_weight(self, vtrr, redis_client, enqueue_script):
+    def test_weight_advances_partition_vt_by_weight(
+        self, vtrr, redis_client, enqueue_script
+    ):
         argv = []
         for task_id, weight in [("a1", 2), ("a2", 1)]:
             payload = json.dumps({"task_name": "t", "args": [], "kwargs": {}})
@@ -414,3 +421,354 @@ class TestCeleryTaskExec:
         # The finally-clause schedules the next dequeue even though the first
         # task raised, so the second task still runs.
         assert ran == ["boom", "ok"]
+
+
+def lease(vtrr):
+    """Dequeue via the real path; returns (task_id, token, timeouts)."""
+    _, _, _, task_id, token, timeouts = vtrr._dequeue()
+    return task_id, token, timeouts
+
+
+def expire(vtrr, task_id):
+    """Make a lease expired by moving its in-flight score into the past (no sleeping)."""
+    vtrr._redis.zadd(vtrr._inflight_key, {task_id: 1}, xx=True)
+
+
+class TestLeases:
+    def test_dequeue_puts_item_in_flight_and_ack_removes_it(
+        self, vtrr, redis_client, enqueue_script
+    ):
+        """Dequeue leases the item (in flight, timeouts 0, token stored); acking
+        with that token deletes all of its lease state."""
+        enqueue_script(make_argv("t", [("A", "a1", [], {})]))
+        task_id, token, timeouts = lease(vtrr)
+        assert (task_id, timeouts) == ("a1", 0)
+        assert redis_client.zscore(vtrr._inflight_key, "a1") > 0
+        assert redis_client.hget(vtrr._lease_key, "a1") == token.encode()
+
+        assert vtrr.ack("a1", token) is True
+        for key in (
+            vtrr._inflight_key,
+            vtrr._inflight_task_key,
+            vtrr._lease_key,
+            vtrr._timeouts_key,
+            vtrr._meta_key,
+        ):
+            assert redis_client.exists(key) == 0
+
+    def test_ack_with_wrong_or_stale_token_changes_nothing(
+        self, vtrr, redis_client, enqueue_script
+    ):
+        """Lease, expire, then re-lease under a new token; acks with the old, a
+        bogus, or an unknown id's token return False and leave the new lease intact."""
+        enqueue_script(make_argv("t", [("A", "a1", [], {})]))
+        _, old_token, _ = lease(vtrr)
+        expire(vtrr, "a1")
+        _, new_token, timeouts = lease(vtrr)  # reclaimed and re-granted
+        assert timeouts == 1 and new_token != old_token
+
+        before = redis_client.zscore(vtrr._inflight_key, "a1")
+        assert vtrr.ack("a1", old_token) is False  # stale holder
+        assert vtrr.ack("a1", "nope") is False
+        assert vtrr.ack("missing", old_token) is False
+        assert redis_client.zscore(vtrr._inflight_key, "a1") == before
+        assert redis_client.hget(vtrr._lease_key, "a1") == new_token.encode()
+        assert redis_client.hget(vtrr._timeouts_key, "a1") == b"1"
+
+    def test_lease_expiry_uses_redis_time_plus_lease_seconds(
+        self, vtrr, redis_client, enqueue_script
+    ):
+        """Lease an item and check its in-flight score is Redis TIME plus
+        lease_seconds (within 5s)."""
+        enqueue_script(make_argv("t", [("A", "a1", [], {})]))
+        sec, usec = redis_client.time()
+        now = sec + usec / 1e6
+        lease(vtrr)
+        assert (
+            abs(
+                redis_client.zscore(vtrr._inflight_key, "a1")
+                - (now + vtrr._lease_seconds)
+            )
+            < 5
+        )
+
+    def test_expired_lease_is_reclaimed_by_dequeue_and_rescored(
+        self, vtrr, redis_client, enqueue_script
+    ):
+        """Expire a1's lease; the next dequeue reclaims it, rescores it like a fresh
+        enqueue (behind a2), and it is handed out again later."""
+        enqueue_script(
+            make_argv(
+                "t", [("A", "a1", [], {}), ("A", "a2", [], {}), ("B", "b1", [], {})]
+            )
+        )
+        assert lease(vtrr)[0] == "a1"  # vt 1
+        assert lease(vtrr)[0] == "b1"  # vt 1; current_vt now 1
+        expire(vtrr, "a1")
+
+        # A fresh enqueue for A would be scored max(partition counter, current_vt + 1)
+        partition_vt = float(redis_client.hget(vtrr._partitions_vt_key, "A"))
+        current_vt = float(redis_client.get(vtrr._current_vt_key))
+        expected = max(partition_vt, current_vt + 1)
+
+        # this dequeue reclaims a1 first, but a2 (vt 2) is still ahead of it
+        assert lease(vtrr)[0] == "a2"
+        assert redis_client.zscore(vtrr._queue_key, "a1") == expected
+        assert redis_client.zscore(vtrr._inflight_key, "a1") is None
+        assert lease(vtrr)[0] == "a1"  # redelivered with its original payload
+
+    def test_timeouts_count_reclaims_and_persist(
+        self, vtrr, redis_client, enqueue_script
+    ):
+        """Timeouts is 0 on the first lease and +1 for each reclaim (by dequeue or
+        reclaim()); it is never reset."""
+        enqueue_script(make_argv("t", [("A", "a1", [], {})]))
+        assert lease(vtrr)[2] == 0  # first dequeue is not a timeout
+        expire(vtrr, "a1")
+        assert lease(vtrr)[2] == 1  # one lease expired and was reclaimed
+        expire(vtrr, "a1")
+        assert vtrr.reclaim() == ["a1"]
+        assert redis_client.hget(vtrr._timeouts_key, "a1") == b"2"
+        assert lease(vtrr)[2] == 2
+
+    def test_standalone_reclaim_only_takes_expired(
+        self, vtrr, redis_client, enqueue_script
+    ):
+        """With a1 expired and b1 still live, reclaim() requeues only a1; a second
+        call finds nothing."""
+        enqueue_script(make_argv("t", [("A", "a1", [], {}), ("B", "b1", [], {})]))
+        lease(vtrr)
+        lease(vtrr)
+        expire(vtrr, "a1")
+        assert vtrr.reclaim() == ["a1"]
+        assert redis_client.zscore(vtrr._queue_key, "a1") is not None
+        assert (
+            redis_client.zscore(vtrr._inflight_key, "b1") is not None
+        )  # unexpired: untouched
+        assert vtrr.reclaim() == []
+
+    def test_wrapper_acks_after_task_even_on_failure(self, vtrr, monkeypatch):
+        """A task that raises still has its lease acked by the wrapper's finally, so
+        a Python error does not cause redelivery."""
+
+        @vtrr.task
+        def work(self):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(vtrr, "_schedule_workers", lambda *a, **k: None)
+        work.queue(partition_key="A", tasks=[{"id": "t1"}])
+        with pytest.raises(RuntimeError):
+            kick(work)
+        assert vtrr._redis.zcard(vtrr._inflight_key) == 0  # acked in finally
+
+    def test_wrapper_does_not_ack_when_process_is_terminated(self, vtrr, monkeypatch):
+        """A task interrupted by SystemExit (billiard's SIGTERM at the hard time limit) keeps its
+        lease, so it expires and the item is reclaimed instead of being acked and lost."""
+
+        @vtrr.task
+        def work(self):
+            raise SystemExit
+
+        monkeypatch.setattr(vtrr, "_schedule_workers", lambda *a, **k: None)
+        work.queue(partition_key="A", tasks=[{"id": "t1"}])
+        with pytest.raises(SystemExit):
+            kick(work)
+        assert vtrr._redis.zscore(vtrr._inflight_key, "t1") is not None  # still leased
+        expire(vtrr, "t1")
+        assert vtrr.reclaim() == ["t1"]
+        assert vtrr._redis.hget(vtrr._timeouts_key, "t1") == b"1"
+
+    def test_timeouts_is_visible_to_task(self, vtrr, monkeypatch):
+        """A task run from a first dequeue sees self.request.vtrr_timeouts == 0."""
+        seen = []
+
+        @vtrr.task
+        def work(self):
+            seen.append(self.request.vtrr_timeouts)
+
+        monkeypatch.setattr(vtrr, "_schedule_workers", lambda *a, **k: None)
+        work.queue(partition_key="A", tasks=[{"id": "t1"}])
+        kick(work)
+        assert seen == [0]
+
+
+class TestRetryReleasesLease:
+    def test_renew_extends_expired_but_unreclaimed_lease(
+        self, vtrr, redis_client, enqueue_script
+    ):
+        """Expire a lease without reclaiming it; renewing with its token succeeds,
+        pushes the expiry to a real future time, and reclaim() finds nothing."""
+        enqueue_script(make_argv("t", [("A", "a1", [], {})]))
+        _, token, _ = lease(vtrr)
+        expire(vtrr, "a1")
+        assert vtrr._renew_lease("a1", token) is True
+        assert redis_client.zscore(vtrr._inflight_key, "a1") > 1e9
+        assert vtrr.reclaim() == []
+
+    def test_renew_fails_after_reclaim_regrant(self, vtrr, enqueue_script):
+        """After expiry, a second dequeue reclaims and re-leases the item under a
+        new token; renewing with the old token returns False."""
+        enqueue_script(make_argv("t", [("A", "a1", [], {})]))
+        _, old_token, _ = lease(vtrr)
+        expire(vtrr, "a1")
+        lease(vtrr)  # reclaimed and re-granted with a new token
+        assert vtrr._renew_lease("a1", old_token) is False
+
+    def test_retry_run_holds_lease_and_acks_at_end(self, vtrr, monkeypatch):
+        """A task that calls self.retry() keeps its lease through the retry (1 in
+        flight on both runs) and acks only after the final run."""
+        in_flight = []
+
+        @vtrr.task(max_retries=2)
+        def work(self):
+            in_flight.append(vtrr._redis.zcard(vtrr._inflight_key))
+            if len(in_flight) == 1:
+                raise self.retry(countdown=0)
+
+        monkeypatch.setattr(vtrr, "_schedule_workers", lambda *a, **k: None)
+        work.queue(partition_key="A", tasks=[{"id": "t1"}])
+        # eager mode runs the retry after the first run returns; don't let Retry propagate
+        work._celery_task.apply(kwargs={"is_start": True}, throw=False)
+        assert in_flight == [1, 1]  # leased during the original run and the retry
+        assert vtrr._redis.zcard(vtrr._inflight_key) == 0  # acked once, at the end
+
+    def test_retry_dropped_when_lease_was_lost(self, vtrr):
+        """A retry run carrying a stale lease token is dropped without running the
+        task."""
+        ran = []
+
+        @vtrr.task
+        def work(self):
+            ran.append(1)
+
+        payload = {
+            "task_name": work.name,
+            "args": [],
+            "kwargs": {},
+            "task_id": "t1",
+            "token": "stale",
+        }
+        work._celery_task.apply(kwargs={"task_payload": payload})
+        assert ran == []
+
+
+class TestReclaimAndDispatch:
+    def test_reclaims_expired_lease_and_schedules_a_trigger(
+        self, vtrr, enqueue_script, monkeypatch
+    ):
+        """With a1's lease expired, reclaim_and_dispatch() returns ['a1'] and
+        schedules one trigger using the task's Celery task."""
+
+        @vtrr.task
+        def work(self):
+            pass
+
+        enqueue_script(make_argv(work.name, [("A", "a1", [], {})]))
+        lease(vtrr)
+        expire(vtrr, "a1")
+        scheduled = []
+        monkeypatch.setattr(
+            vtrr, "_schedule_workers", lambda n, t: scheduled.append((n, t))
+        )
+
+        assert vtrr.reclaim_and_dispatch() == ["a1"]
+        assert scheduled == [(1, work._celery_task)]
+
+    def test_tops_up_triggers_for_an_idle_queue_with_nothing_reclaimed(
+        self, vtrr, enqueue_script, monkeypatch
+    ):
+        """Two items waiting and nothing expired: it still schedules 2 triggers,
+        covering triggers lost while the queue sat idle."""
+
+        # e.g. every trigger was lost: items are waiting but no worker will ever wake up
+        @vtrr.task
+        def work(self):
+            pass
+
+        enqueue_script(make_argv(work.name, [("A", "a1", [], {}), ("A", "a2", [], {})]))
+        scheduled = []
+        monkeypatch.setattr(vtrr, "_schedule_workers", lambda n, t: scheduled.append(n))
+
+        assert vtrr.reclaim_and_dispatch() == []
+        assert scheduled == [2]
+
+    def test_unexpired_lease_is_left_alone(self, vtrr, enqueue_script):
+        """A live lease is not reclaimed: it returns [] and the item stays in
+        flight."""
+
+        @vtrr.task
+        def work(self):
+            pass
+
+        enqueue_script(make_argv(work.name, [("A", "a1", [], {})]))
+        lease(vtrr)
+        assert vtrr.reclaim_and_dispatch() == []
+        assert vtrr._redis.zscore(vtrr._inflight_key, "a1") is not None
+
+
+class TestReclaimSchedule:
+    def test_disabled_by_default(self, vtrr, celery_app):
+        """Without reclaim_interval there is no beat entry and no reclaim task
+        registered with Celery."""
+        assert vtrr.reclaim_beat_schedule() == {}
+        assert not celery_app.conf.beat_schedule
+        assert "vtrr_queue.reclaim.test" not in celery_app.tasks
+
+    def test_enabled_registers_task_and_beat_entry(self, redis_client, celery_app):
+        """With reclaim_interval and reclaim_queue, the beat entry is merged
+        alongside existing entries and the reclaim task is registered."""
+        celery_app.conf.beat_schedule = {"existing": {"task": "x", "schedule": 1.0}}
+        q = VTRRQueue(
+            redis_client=redis_client,
+            celery_app=celery_app,
+            name="test",
+            reclaim_interval=600,
+            reclaim_queue="other",
+        )
+        entry = celery_app.conf.beat_schedule["vtrr_queue.reclaim.test"]
+        assert entry == {
+            "task": "vtrr_queue.reclaim.test",
+            "schedule": 600.0,
+            "options": {"queue": "other"},
+        }
+        assert "existing" in celery_app.conf.beat_schedule  # merged, not replaced
+        assert q.reclaim_beat_schedule() == {"vtrr_queue.reclaim.test": entry}
+        assert "vtrr_queue.reclaim.test" in celery_app.tasks
+
+    def test_queue_option_omitted_when_unset(self, redis_client, celery_app):
+        """Without reclaim_queue the beat entry has no 'options', so Celery uses its
+        default queue."""
+        q = VTRRQueue(
+            redis_client=redis_client,
+            celery_app=celery_app,
+            name="test",
+            reclaim_interval=60,
+        )
+        assert "options" not in q.reclaim_beat_schedule()["vtrr_queue.reclaim.test"]
+
+    def test_registered_celery_task_runs_reclaim_and_dispatch(
+        self, redis_client, celery_app, monkeypatch
+    ):
+        """Running the registered reclaim Celery task calls reclaim_and_dispatch()
+        once."""
+        q = VTRRQueue(
+            redis_client=redis_client,
+            celery_app=celery_app,
+            name="test",
+            reclaim_interval=60,
+        )
+        called = []
+        monkeypatch.setattr(q, "reclaim_and_dispatch", lambda: called.append(1))
+        celery_app.tasks["vtrr_queue.reclaim.test"].apply()
+        assert called == [1]
+
+    @pytest.mark.parametrize("interval", [0, -5])
+    def test_rejects_non_positive_interval(self, redis_client, celery_app, interval):
+        """A zero or negative reclaim_interval raises ValueError at construction."""
+        with pytest.raises(ValueError):
+            VTRRQueue(
+                redis_client=redis_client,
+                celery_app=celery_app,
+                name="test",
+                reclaim_interval=interval,
+            )

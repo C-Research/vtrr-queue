@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vtrr-queue"
-version = "0.1.0"
+version = "0.2.0"
 description = "Virtual-time round-robin fair queue on Redis"
 readme = "README.md"
 authors = [{ name = "Nicolas Johnson", email = "nicolas.johnson@c4ads.org" }]

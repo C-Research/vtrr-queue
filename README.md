@@ -10,6 +10,7 @@ Integrates with an existing Celery + Redis setup. The library owns the dequeue l
 - Python >= 3.12
 - Redis (used for both the VTRR queue state and as the Celery broker)
 - Celery >= 5.0
+- Optional but recommended: Celery Beat (or any scheduler that can call `vtrr.reclaim_and_dispatch()`). Queueing and running tasks work without it, but recovering work from a dead worker when the queue is otherwise idle does not. See [Periodic reclaim](#periodic-reclaim-with-celery-beat)
 
 
 ## Installation
@@ -81,6 +82,9 @@ Use a dedicated Redis DB index for the VTRR queue so its keys don't collide with
 | `name` | `str` | required | Unique name for this queue instance; namespaces all Redis keys as `vtrr:{name}:*` |
 | `celery_queue` | `str` | `"vtrr_queue"` | Celery queue name for the dispatcher task |
 | `max_concurrency` | `int` | `4` | Max dequeue workers held in the broker at once |
+| `lease_seconds` | `int` | `3900` | How long a dequeued item stays leased before it is reclaimed. **Must exceed the task's hard `time_limit`.** See [Leasing](#leasing-and-at-least-once-delivery) |
+| `reclaim_interval` | `float \| None` | `None` | Seconds between periodic reclaims run by Celery Beat. `None` disables it. See [Periodic reclaim](#periodic-reclaim-with-celery-beat) |
+| `reclaim_queue` | `str \| None` | `None` | Celery queue the reclaim task is sent to. `None` uses your default queue. See [Periodic reclaim](#periodic-reclaim-with-celery-beat) |
 
 
 ### 2. Register a dedicated Celery worker
@@ -187,8 +191,10 @@ Each task dict may also include an `"id"` key to supply a stable task ID; otherw
 | `retry_kwargs` | Dict of kwargs passed to `self.retry()`, e.g. `{"countdown": 10}` |
 | `soft_time_limit` | Seconds before a `SoftTimeLimitExceeded` is raised in the worker |
 | `time_limit` | Hard kill timeout in seconds |
+| `acks_late` | Ack the Celery trigger after the task finishes. Optional: leasing does not depend on it |
+| `reject_on_worker_lost` | Requeue the trigger if the worker process is killed mid-task. Optional: leasing does not depend on it |
 
-Since each `@vtrr.task` becomes its own Celery task, different task functions can have different retry policies and time limits.
+A `VTRRQueue` runs exactly one task: decorating a second function on the same instance raises `ValueError`. Every Celery trigger on a queue dequeues whatever item is next, so the Celery options (time limits, retries, `base`) must belong to the one task that every item runs. For several task types, create one `VTRRQueue` per task, each with its own `name` and `celery_queue`.
 
 
 ## Django-specific setup
@@ -286,20 +292,106 @@ class UploadView(View):
 ```
 
 
+## Leasing and at-least-once delivery
+
+Dequeuing an item does not delete it; it **leases** it. The item moves to an in-flight set with an expiry of `redis_time + lease_seconds` (Redis `TIME`, so worker clock skew is irrelevant) and its lease token is stored. The `@vtrr.task` wrapper acks the lease when your function returns. If the worker dies first, the lease expires and the next dequeue (or a call to `vtrr.reclaim()`, or the [periodic reclaim](#periodic-reclaim-with-celery-beat)) puts the item back in the queue, **rescored** under VTRR as if freshly enqueued; it does not keep its old position. Each reclaim adds one to the item's **timeouts** count, which is never reset.
+
+Delivery is therefore **at-least-once: task bodies must be idempotent.** Inside a task, `self.request.vtrr_timeouts` is how many times this item's lease has expired and been reclaimed: 0 on the first run, +1 each time it is run again after a timeout. The library does not cap timeouts; your task decides when to give up (see [Timeout limits](#timeout-limits)).
+
+The wrapper acks in a `finally`, so a Python exception does not redeliver forever; only process death or lease expiry does. This matches Celery's default `task_acks_on_failure_or_timeout=True`. A non-`Exception` such as `SystemExit` is treated as process death and is *not* acked: billiard raises `SystemExit` in the task when the hard time limit sends SIGTERM (SIGKILL follows ~0.1s later), so a task killed by its hard `time_limit` keeps its lease, is reclaimed, and counts as a timeout. If you use the low-level API directly:
+
+```python
+task_name, args, kwargs, task_id, token, timeouts = vtrr._dequeue()
+try:
+    ...
+finally:
+    vtrr.ack(task_id, token)   # False if the lease already expired and was re-granted; harmless
+```
+
+`self.retry()` / `autoretry_for` keep the lease: the wrapper does not ack when a task retries, and the retry run re-leases the item (expiry reset to `redis_time + lease_seconds`) and acks when it finishes. If the lease was already reclaimed during the retry delay (for example a `countdown` longer than `lease_seconds`), the item belongs to a newer delivery and the retry run is dropped instead of executing twice.
+
+`ack` is fenced: it only succeeds when the token matches the current lease, so a slow worker whose lease was reclaimed cannot ack the new holder's lease.
+
+### Celery configuration and timing
+
+Recovery does not depend on Celery's delivery guarantees. The Celery message that wakes a worker (the "trigger") carries no payload; the work item lives in Redis under its lease. If a worker dies, the item comes back when its lease expires, and [periodic reclaim](#periodic-reclaim-with-celery-beat) wakes a worker for it. You do not need `acks_late`, `reject_on_worker_lost`, or a raised `visibility_timeout` for this. (They remain available task options. `reject_on_worker_lost` in particular does not speed recovery: the requeued trigger runs while the lease is still held, so it cannot reclaim the item.)
+
+Required order:
+
+```
+soft_time_limit < time_limit (hard) < lease_seconds
+```
+
+For an hour-long task: soft 3600, hard 3720, lease 3900.
+
+```python
+vtrr = VTRRQueue(..., lease_seconds=3900, reclaim_interval=600)
+
+@vtrr.task(soft_time_limit=3600, time_limit=3720)
+def process_file(self, ...):
+    ...
+```
+
+- **Hard `time_limit` is required.** `soft_time_limit` only raises an exception, which blocking C/IO code can delay or swallow. The hard limit kills the process, so by the time a lease expires the original holder is gone and reclaim rarely causes concurrent executions. Hitting the hard limit is itself recovered the same way: the lease is not acked, so the item is reclaimed after `lease_seconds` and its `timeouts` count goes up.
+- **`lease_seconds` > hard limit**, for the reason above.
+- A recovered item waits for its lease to expire, so worst-case recovery time is about `lease_seconds + reclaim_interval`.
+- If you do enable `acks_late`, the Redis transport's `visibility_timeout` (default 3600s, broker-wide) applies to it: a trigger held unacked longer is redelivered while still running. The lease token fences the duplicate, but keep `visibility_timeout` above your longest task.
+
+### Periodic reclaim with Celery Beat
+
+Reclaim also runs at the start of every dequeue, but that is not enough on its own: if the queue is idle, or every trigger for waiting items has been lost (a worker died between receiving its trigger and dequeuing), no dequeue happens and the item sits there. `vtrr.reclaim_and_dispatch()` reclaims expired leases and then schedules dequeue workers for whatever is waiting (up to `max_concurrency` minus the triggers already in the broker). It is cheap: when nothing has expired and the queue is empty it is one Redis call that returns immediately.
+
+Pass `reclaim_interval` to run it on Celery Beat:
+
+```python
+vtrr = VTRRQueue(..., reclaim_interval=600, reclaim_queue="celery")
+```
+
+At construction the library registers a task named `vtrr_queue.reclaim.{name}` and merges its entry into `celery_app.conf.beat_schedule`. You still have to run Beat (`celery -A myapp beat`), and the process that executes the task must have imported your `@vtrr.task` functions, which it uses as triggers.
+
+- **`reclaim_queue`**: leave it unset to use your default Celery queue, or name a queue that some worker consumes. Don't send it to `celery_queue` if those workers are usually busy with long tasks; it would wait behind them.
+- **If your app assigns `beat_schedule` wholesale after creating the `VTRRQueue`**, it overwrites the entry. Merge `vtrr.reclaim_beat_schedule()` back in:
+
+  ```python
+  app.conf.beat_schedule = {**my_entries, **vtrr.reclaim_beat_schedule()}
+  ```
+- **Without Beat**, call `vtrr.reclaim_and_dispatch()` from whatever scheduler you have (cron, a management command, etc.).
+
+### Timeout limits
+
+The library never gives up on an item: every expired lease is reclaimed and re-enqueued. To cap redeliveries, check the timeouts count in your task and return early; the wrapper then acks the item and it is dropped.
+
+```python
+MAX_TIMEOUTS = 3
+
+@vtrr.task(soft_time_limit=3600, time_limit=3720)
+def process_file(self, ...):
+    if self.request.vtrr_timeouts >= MAX_TIMEOUTS:
+        log_poison_item(...)   # your own dead-letter handling
+        return
+    ...
+```
+
+
 ## Redis keys
 
-Each `VTRRQueue` instance manages four keys namespaced under `vtrr:{name}:*`.
+Each `VTRRQueue` instance manages these keys, namespaced under `vtrr:{name}:*`.
 
 | Key | Type | Description |
 |---|---|---|
 | `vtrr:{name}:queue` | Sorted Set | Task IDs scored by virtual time; lowest score = highest priority |
 | `vtrr:{name}:current_virtual_time` | String | Virtual time of the last dequeued task; resets to 0 when queue drains |
 | `vtrr:{name}:partition_virtual_time` | Hash | Per-partition virtual time counter; deleted when queue drains |
-| `vtrr:{name}:task` | Hash | `task_id → JSON payload`; deleted when queue drains |
+| `vtrr:{name}:task` | Hash | `task_id → JSON payload` for queued items; deleted when queue drains |
+| `vtrr:{name}:meta` | Hash | `task_id → "weight:partition_key"`, kept until ack so reclaim can rescore |
+| `vtrr:{name}:inflight` | Sorted Set | Leased task IDs scored by lease expiry (Redis time) |
+| `vtrr:{name}:inflight_task` | Hash | `task_id → JSON payload` for leased items |
+| `vtrr:{name}:lease` | Hash | `task_id → lease token` |
+| `vtrr:{name}:timeouts` | Hash | `task_id → times its lease expired and was reclaimed`; cleared on ack |
 
 Multiple `VTRRQueue` instances in the same application can safely share a Redis database as long as they have distinct `name` values.
 
-All enqueue and dequeue operations are atomic Lua scripts, so concurrent writers and workers are safe.
+All enqueue, dequeue, ack and reclaim operations are atomic Lua scripts, so concurrent writers and workers are safe.
 
 # Development
 
