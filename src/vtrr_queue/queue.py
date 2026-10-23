@@ -250,6 +250,7 @@ class VTRRQueue:
                         "token": token,
                     }
                 else:
+                    # Retry attempt
                     dequeued_name = task_payload["task_name"]
                     args = task_payload["args"]
                     kwargs = task_payload["kwargs"]
