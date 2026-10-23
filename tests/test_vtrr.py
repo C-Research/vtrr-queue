@@ -561,6 +561,23 @@ class TestLeases:
             kick(work)
         assert vtrr._redis.zcard(vtrr._inflight_key) == 0  # acked in finally
 
+    def test_wrapper_does_not_ack_when_process_is_terminated(self, vtrr, monkeypatch):
+        """A task interrupted by SystemExit (billiard's SIGTERM at the hard time limit) keeps its
+        lease, so it expires and the item is reclaimed instead of being acked and lost."""
+
+        @vtrr.task
+        def work(self):
+            raise SystemExit
+
+        monkeypatch.setattr(vtrr, "_schedule_workers", lambda *a, **k: None)
+        work.queue(partition_key="A", tasks=[{"id": "t1"}])
+        with pytest.raises(SystemExit):
+            kick(work)
+        assert vtrr._redis.zscore(vtrr._inflight_key, "t1") is not None  # still leased
+        expire(vtrr, "t1")
+        assert vtrr.reclaim() == ["t1"]
+        assert vtrr._redis.hget(vtrr._timeouts_key, "t1") == b"1"
+
     def test_timeouts_is_visible_to_task(self, vtrr, monkeypatch):
         """A task run from a first dequeue sees self.request.vtrr_timeouts == 0."""
         seen = []

@@ -271,6 +271,7 @@ class VTRRQueue:
                 celery_task.request.vtrr_timeouts = task_payload.get("timeouts", 0)
 
                 retrying = False
+                terminated = False
                 try:
                     registered = vtrr._task
                     if registered is None or registered.name != dequeued_name:
@@ -285,8 +286,15 @@ class VTRRQueue:
                     # Keep the lease: the retry run re-leases it (renew) and acks when done.
                     retrying = True
                     raise
+                except BaseException as err:
+                    # A non-Exception (SystemExit, KeyboardInterrupt, ...) means the process is being
+                    # terminated, e.g. billiard's SIGTERM at the hard time limit (it raises SystemExit
+                    # in the task and SIGKILLs ~0.1s later). Treat it like process death: don't ack.
+                    if not isinstance(err, Exception):
+                        terminated = True
+                    raise
                 finally:
-                    if token and not retrying:
+                    if token and not retrying and not terminated:
                         # Ack even on failure: only process death / lease expiry redelivers.
                         # A failed ack just means the item is redelivered after the lease expires.
                         try:
