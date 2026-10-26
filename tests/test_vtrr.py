@@ -596,8 +596,8 @@ class TestRetryReleasesLease:
     def test_renew_extends_expired_but_unreclaimed_lease(
         self, vtrr, redis_client, enqueue_script
     ):
-        """Expire a lease without reclaiming it; renewing with its token succeeds,
-        pushes the expiry to a real future time, and reclaim() finds nothing."""
+        """Renew can extend an expired lease unless the lease is reclaimed.
+        Reclaimed item must get a new lease."""
         enqueue_script(make_argv("t", [("A", "a1", [], {})]))
         _, token, _ = lease(vtrr)
         expire(vtrr, "a1")
@@ -633,8 +633,8 @@ class TestRetryReleasesLease:
         assert vtrr._redis.zcard(vtrr._inflight_key) == 0  # acked once, at the end
 
     def test_retry_dropped_when_lease_was_lost(self, vtrr):
-        """A retry run carrying a stale lease token is dropped without running the
-        task."""
+        """A retry run whose token no longer matches any lease (reclaimed, re-granted or
+        acked) is dropped without."""
         ran = []
 
         @vtrr.task
@@ -646,7 +646,7 @@ class TestRetryReleasesLease:
             "args": [],
             "kwargs": {},
             "task_id": "t1",
-            "token": "stale",
+            "token": "stale",  # Won't match anything
         }
         work._celery_task.apply(kwargs={"task_payload": payload})
         assert ran == []
@@ -674,10 +674,8 @@ class TestReclaimAndDispatch:
         assert vtrr.reclaim_and_dispatch() == ["a1"]
         assert scheduled == [(1, work._celery_task)]
 
-    def test_tops_up_triggers_for_an_idle_queue_with_nothing_reclaimed(
-        self, vtrr, enqueue_script, monkeypatch
-    ):
-        """Two items waiting and nothing expired: it still schedules 2 triggers,
+    def test_triggers_for_an_idle_queue(self, vtrr, enqueue_script, monkeypatch):
+        """Two items waiting: schedules 2 triggers,
         covering triggers lost while the queue sat idle."""
 
         # e.g. every trigger was lost: items are waiting but no worker will ever wake up

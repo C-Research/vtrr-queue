@@ -383,7 +383,6 @@ class VTRRQueue:
     def reclaim(self) -> list[str]:
         """
         Re-enqueue (rescored) every item whose lease has expired. Returns the ids that were re-enqueued.
-        Also runs automatically at the start of every dequeue.
         """
         ids = self._reclaim_script(keys=self._keys, args=[])
         return [_decode(i) for i in ids]
@@ -437,8 +436,6 @@ class VTRRQueue:
         return {self._reclaim_task_name: entry}
 
     def _register_reclaim_task(self) -> None:
-        # shared=False: bind to this app only. Celery's default shares the task with every
-        # app finalized later in the process, which would run it against this queue's closure.
         @self._celery_app.task(
             name=self._reclaim_task_name, ignore_result=True, shared=False
         )
