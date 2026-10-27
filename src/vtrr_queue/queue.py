@@ -4,6 +4,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 from celery import Task
+from celery.exceptions import Retry
 
 
 import redis as redis_lib
@@ -11,6 +12,10 @@ import redis as redis_lib
 logger = logging.getLogger(__name__)
 
 _SCRIPTS_DIR = Path(__file__).parent / "scripts"
+
+
+def _decode(value: bytes | str) -> str:
+    return value.decode() if isinstance(value, (bytes, bytearray)) else value
 
 
 class VTRRTask:
@@ -99,6 +104,7 @@ def _resolve_base(user_base: type | None) -> type:
 
 class VTRRQueue:
     DEFAULT_MAX_CONCURRENCY = 4
+    DEFAULT_LEASE_SECONDS = 3900
 
     def __init__(
         self,
@@ -108,38 +114,64 @@ class VTRRQueue:
         name: str,
         celery_queue: str = "vtrr_queue",
         max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+        reclaim_interval: float | None = None,
+        reclaim_queue: str | None = None,
     ) -> None:
+        if reclaim_interval is not None and reclaim_interval <= 0:
+            raise ValueError("reclaim_interval must be a positive number of seconds")
         self._redis = redis_client
         self._celery_app = celery_app
         self._celery_queue = celery_queue
         self._max_concurrency = max_concurrency
-        self._registry: dict[str, VTRRTask] = {}
+        self._lease_seconds = lease_seconds
+        self._reclaim_interval = reclaim_interval
+        self._reclaim_queue = reclaim_queue
+        self._reclaim_task_name = f"vtrr_queue.reclaim.{name}"
+        self._name = name
+        self._task: VTRRTask | None = None
 
         prefix = f"vtrr:{name}"
         self._queue_key = f"{prefix}:queue"
         self._current_vt_key = f"{prefix}:current_virtual_time"
         self._task_key = f"{prefix}:task"
         self._partitions_vt_key = f"{prefix}:partition_virtual_time"
-        self._enqueue_keys = [
+        self._meta_key = f"{prefix}:meta"
+        self._inflight_key = f"{prefix}:inflight"
+        self._inflight_task_key = f"{prefix}:inflight_task"
+        self._lease_key = f"{prefix}:lease"
+        self._timeouts_key = f"{prefix}:timeouts"
+        # Every Lua script takes the same KEYS (see scripts/common.lua)
+        self._keys = [
+            self._queue_key,
             self._current_vt_key,
             self._partitions_vt_key,
-            self._queue_key,
             self._task_key,
+            self._meta_key,
+            self._inflight_key,
+            self._inflight_task_key,
+            self._lease_key,
+            self._timeouts_key,
         ]
-        self._dequeue_keys = [
-            self._queue_key,
-            self._current_vt_key,
-            self._task_key,
-            self._partitions_vt_key,
-        ]
+        self._enqueue_keys = self._dequeue_keys = self._keys
 
+        self._common_lua = (_SCRIPTS_DIR / "common.lua").read_text()
         self._enqueue_script = self._load_script("enqueue")
         self._dequeue_script = self._load_script("dequeue")
+        self._reclaim_script = self._load_script("reclaim")
+        self._ack_script = self._load_script("ack")
+        self._renew_script = self._load_script("renew")
         self._broker: redis_lib.Redis | None = self._connect_broker()
+
+        if reclaim_interval is not None:
+            self._register_reclaim_task()
 
     def task(self, fn: Callable | None = None, **task_options: Any) -> Any:
         """
         Decorator that registers a function as a VTRR-dispatchable Celery task.
+
+        A VTRRQueue runs exactly one task: decorating a second function raises ValueError. Use one
+        VTRRQueue (with its own `name` and `celery_queue`) per task.
 
         The first argument is always `self` (the bound Celery task), then any args/kwargs from .queue():
 
@@ -160,12 +192,24 @@ class VTRRQueue:
             "retry_backoff_max",
             "retry_jitter",
             "retry_kwargs",
+            # delivery
+            "acks_late",
+            "reject_on_worker_lost",
             # base class
             "base",
         }
 
         def decorator(f: Callable) -> VTRRTask:
             vtrr = self
+            # Re-decorating the same function (e.g. a module reload) just replaces it
+            if (
+                self._task is not None
+                and self._task.name != f"{f.__module__}.{f.__name__}"
+            ):
+                raise ValueError(
+                    f"VTRRQueue {self._name!r} already runs task {self._task.name!r}; "
+                    f"create a separate VTRRQueue to register {f.__module__}.{f.__name__}"
+                )
             unsupported_task_options = set(task_options) - _ALLOWED_TASK_OPTIONS
             if unsupported_task_options:
                 raise TypeError(
@@ -196,36 +240,78 @@ class VTRRQueue:
                                 countdown=3,
                             )
                         return  # queue empty — stop draining, no reschedule
-                    dequeued_name, args, kwargs = result
+                    dequeued_name, args, kwargs, task_id, token, timeouts = result
                     task_payload = {
                         "task_name": dequeued_name,
                         "args": args,
                         "kwargs": kwargs,
+                        "timeouts": timeouts,
+                        "task_id": task_id,
+                        "token": token,
                     }
                 else:
+                    # Retry attempt
                     dequeued_name = task_payload["task_name"]
                     args = task_payload["args"]
                     kwargs = task_payload["kwargs"]
+                    task_id = task_payload.get("task_id")
+                    token = task_payload.get("token")
+                    if token and not vtrr._renew_lease(task_id, token):
+                        # Lease expired and was reclaimed: the item belongs to another run now.
+                        logger.warning(
+                            "vtrr_queue: lease for %s lost before retry — dropping retry",
+                            task_id,
+                        )
+                        return
 
                 # Per-invocation stash (safe under threaded/gevent pools);
                 # retry() reads this to re-run the same item.
                 celery_task.request.vtrr_payload = task_payload
+                # 0 on the first run; +1 each time the item's lease expired and it was reclaimed
+                celery_task.request.vtrr_timeouts = task_payload.get("timeouts", 0)
 
+                retrying = False
+                terminated = False
                 try:
-                    registered = vtrr._registry.get(dequeued_name)
-                    if registered is None:
+                    registered = vtrr._task
+                    if registered is None or registered.name != dequeued_name:
                         logger.error(
-                            "vtrr_queue: unknown task %r — dropped", dequeued_name
+                            "vtrr_queue: item for task %r does not match this queue's task %r — dropped",
+                            dequeued_name,
+                            registered.name if registered else None,
                         )
                         return
                     registered._fn(celery_task, *args, **kwargs)
+                except Retry:
+                    # Keep the lease: the retry run re-leases it (renew) and acks when done.
+                    retrying = True
+                    raise
+                except BaseException as err:
+                    # A non-Exception (SystemExit, KeyboardInterrupt, ...) means the process is being
+                    # terminated, e.g. billiard's SIGTERM at the hard time limit (it raises SystemExit
+                    # in the task and SIGKILLs ~0.1s later). Treat it like process death: don't ack.
+                    if not isinstance(err, Exception):
+                        terminated = True
+                    raise
                 finally:
+                    if token and not retrying and not terminated:
+                        # Ack even on failure: only process death / lease expiry redelivers.
+                        # A failed ack just means the item is redelivered after the lease expires.
+                        try:
+                            vtrr.ack(task_id, token)
+                        except Exception as err:
+                            logger.error(
+                                "vtrr_queue: could not ack %s: %s",
+                                task_id,
+                                err,
+                                exc_info=True,
+                            )
                     if dispatched:
                         # In case there's an exception, schedule next dequeue
                         vtrr._schedule_next(celery_task)
 
             wrapped = VTRRTask(f, self, celery_wrapper)
-            self._registry[wrapped.name] = wrapped
+            self._task = wrapped
             return wrapped
 
         if fn is not None:
@@ -237,7 +323,7 @@ class VTRRQueue:
     # ------------------------------------------------------------------
 
     def _load_script(self, name: str) -> Any:
-        src = (_SCRIPTS_DIR / f"{name}.lua").read_text()
+        src = self._common_lua + (_SCRIPTS_DIR / f"{name}.lua").read_text()
         return self._redis.register_script(src)
 
     def _connect_broker(self) -> redis_lib.Redis | None:
@@ -254,11 +340,18 @@ class VTRRQueue:
     def _enqueue(self, argv: list[str]) -> None:
         self._enqueue_script(keys=self._enqueue_keys, args=argv)
 
-    def _dequeue(self) -> tuple[str, str, list, dict] | None:
-        raw = self._dequeue_script(keys=self._dequeue_keys, args=[])
+    def _dequeue(self) -> tuple[str, list, dict, str, str, int] | None:
+        """Lease the next item: (task_name, args, kwargs, task_id, lease_token, timeouts)."""
+        raw = self._dequeue_script(
+            keys=self._dequeue_keys,
+            args=[
+                self._lease_seconds,
+                uuid.uuid4().hex,
+            ],
+        )
         if not raw:
             return None
-        _, payload_bytes = raw
+        task_id, payload_bytes, token, timeouts = raw
         if isinstance(payload_bytes, (bytes, bytearray)):
             payload_bytes = payload_bytes.decode()
         payload = json.loads(payload_bytes)
@@ -266,7 +359,92 @@ class VTRRQueue:
             payload["task_name"],
             payload["args"],
             payload["kwargs"],
+            _decode(task_id),
+            _decode(token),
+            int(timeouts),
         )
+
+    # ------------------------------------------------------------------
+    # Public: leases
+    # ------------------------------------------------------------------
+
+    def ack(self, task_id: str, token: str) -> bool:
+        """Release a leased item. False (and no change) if the token doesn't match the current lease."""
+        return bool(self._ack_script(keys=self._keys, args=[task_id, token]))
+
+    def _renew_lease(self, task_id: str, token: str) -> bool:
+        """Extend a held lease by `lease_seconds`. False if the token no longer matches."""
+        return bool(
+            self._renew_script(
+                keys=self._keys, args=[task_id, token, self._lease_seconds]
+            )
+        )
+
+    def reclaim(self) -> list[str]:
+        """
+        Re-enqueue (rescored) every item whose lease has expired. Returns the ids that were re-enqueued.
+        """
+        ids = self._reclaim_script(keys=self._keys, args=[])
+        return [_decode(i) for i in ids]
+
+    def reclaim_and_dispatch(self) -> list[str]:
+        """
+        Reclaim expired leases.
+        If a worker silently fails (OOM, restarts, etc) it may silently drop the item it was working on.
+        Reclaim will check if the lease on that item has expired, then dispatch a new worker on it.
+
+        Returns the ids that were re-enqueued.
+        """
+        # Reclaim expired leases
+        reclaimed = self.reclaim()
+
+        # Refresh/saturate scheduled workers if there are items in the queue.
+        try:
+            waiting = int(self._redis.zcard(self._queue_key))
+        except Exception as err:
+            logger.error(
+                "vtrr_queue: could not read queue length: %s", err, exc_info=True
+            )
+            return reclaimed
+        if waiting:
+            if self._task is None:
+                logger.error(
+                    "vtrr_queue: %d item(s) waiting but no @vtrr.task is registered in this process",
+                    waiting,
+                )
+            else:
+                self._schedule_workers(waiting, self._task._celery_task)
+        return reclaimed
+
+    def reclaim_beat_schedule(self) -> dict[str, dict[str, Any]]:
+        """
+        The Celery Beat entry for periodic reclaim, or {} if `reclaim_interval` is unset.
+
+        Merged into `celery_app.conf.beat_schedule` automatically at construction. Use this to
+        re-add it if your app assigns `beat_schedule` wholesale after creating the VTRRQueue:
+
+            app.conf.beat_schedule = {**my_entries, **vtrr.reclaim_beat_schedule()}
+        """
+        if self._reclaim_interval is None:
+            return {}
+        entry: dict[str, Any] = {
+            "task": self._reclaim_task_name,
+            "schedule": float(self._reclaim_interval),
+        }
+        if self._reclaim_queue:
+            entry["options"] = {"queue": self._reclaim_queue}
+        return {self._reclaim_task_name: entry}
+
+    def _register_reclaim_task(self) -> None:
+        @self._celery_app.task(
+            name=self._reclaim_task_name, ignore_result=True, shared=False
+        )
+        def reclaim_task() -> None:
+            self.reclaim_and_dispatch()
+
+        schedule = dict(self._celery_app.conf.beat_schedule or {})
+        schedule.update(self.reclaim_beat_schedule())
+        self._celery_app.conf.beat_schedule = schedule
 
     # ------------------------------------------------------------------
     # Internal: worker scheduling
