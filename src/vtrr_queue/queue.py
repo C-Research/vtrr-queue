@@ -4,7 +4,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 from celery import Task
-from celery.exceptions import Retry
+from celery.exceptions import Retry, SoftTimeLimitExceeded
+from celery.utils.time import get_exponential_backoff_interval
 
 
 import redis as redis_lib
@@ -219,6 +220,13 @@ class VTRRQueue:
             options = dict(task_options)
             options.pop("bind", None)
             base = _resolve_base(options.pop("base", None))
+            # Autoretry is re-implemented by celery_wrapper instead of using Celery's autoretry_for wrapper
+            # This is to support retries along with vtrr_queue timeouts/message leasing
+            autoretry_for = tuple(options.pop("autoretry_for", ()))
+            retry_backoff = float(options.pop("retry_backoff", False))
+            retry_backoff_max = int(options.pop("retry_backoff_max", 600))
+            retry_jitter = options.pop("retry_jitter", True)
+            retry_kwargs = options.pop("retry_kwargs", {})
             task_name = f"{f.__module__}.{f.__name__}"
 
             @self._celery_app.task(name=task_name, bind=True, base=base, **options)
@@ -281,10 +289,34 @@ class VTRRQueue:
                             registered.name if registered else None,
                         )
                         return
-                    registered._fn(celery_task, *args, **kwargs)
+                    try:
+                        registered._fn(celery_task, *args, **kwargs)
+                    except Retry:
+                        # This exception is only raised by celery if self.retry()
+                        # was already called by the inner function, so assume the retry task is already scheduled.
+                        raise
+                    except SoftTimeLimitExceeded:
+                        # Treated as a vtrr timeout. Re-raise so terminated=True and message goes through the lease lifecycle.
+                        raise
+                    except autoretry_for as exc:
+                        # Raises Retry (lease kept), or re-raises exc once retries are exhausted.
+                        auto_retry_kwargs = dict(retry_kwargs)
+                        if retry_backoff:
+                            auto_retry_kwargs["countdown"] = (
+                                get_exponential_backoff_interval(
+                                    factor=int(max(1.0, retry_backoff)),
+                                    retries=celery_task.request.retries,
+                                    maximum=retry_backoff_max,
+                                    full_jitter=retry_jitter,
+                                )
+                            )
+                        celery_task.retry(exc=exc, **auto_retry_kwargs)
                 except Retry:
                     # Keep the lease: the retry run re-leases it (renew) and acks when done.
                     retrying = True
+                    raise
+                except SoftTimeLimitExceeded:
+                    terminated = True
                     raise
                 except BaseException as err:
                     # A non-Exception (SystemExit, KeyboardInterrupt, ...) means the process is being

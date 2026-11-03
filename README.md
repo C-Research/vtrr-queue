@@ -298,7 +298,7 @@ Dequeuing an item does not delete it; it **leases** it. The item moves to an in-
 
 Delivery is therefore **at-least-once: task bodies must be idempotent.** Inside a task, `self.request.vtrr_timeouts` is how many times this item's lease has expired and been reclaimed: 0 on the first run, +1 each time it is run again after a timeout. The library does not cap timeouts; your task decides when to give up (see [Timeout limits](#timeout-limits)).
 
-The wrapper acks in a `finally`, so a Python exception does not redeliver forever; only process death or lease expiry does. This matches Celery's default `task_acks_on_failure_or_timeout=True`. A non-`Exception` such as `SystemExit` is treated as process death and is *not* acked: billiard raises `SystemExit` in the task when the hard time limit sends SIGTERM (SIGKILL follows ~0.1s later), so a task killed by its hard `time_limit` keeps its lease, is reclaimed, and counts as a timeout. If you use the low-level API directly:
+A task that raises an exception is not redelivered: the item is acked and finished, as in Celery's default behavior. Only a time limit or a dead worker causes redelivery (see [Retries and timeouts](#retries-and-timeouts)). If you use the low-level API directly:
 
 ```python
 task_name, args, kwargs, task_id, token, timeouts = vtrr._dequeue()
@@ -308,9 +308,22 @@ finally:
     vtrr.ack(task_id, token)   # False if the lease already expired and was re-granted; harmless
 ```
 
-`self.retry()` / `autoretry_for` keep the lease: the wrapper does not ack when a task retries, and the retry run re-leases the item (expiry reset to `redis_time + lease_seconds`) and acks when it finishes. If the lease was already reclaimed during the retry delay (for example a `countdown` longer than `lease_seconds`), the item belongs to a newer delivery and the retry run is dropped instead of executing twice.
-
 `ack` is fenced: it only succeeds when the token matches the current lease, so a slow worker whose lease was reclaimed cannot ack the new holder's lease.
+
+### Retries and timeouts
+
+| What happens in the task | Result | Counts as a timeout (`vtrr_timeouts`) |
+|---|---|---|
+| Returns normally | Done | No |
+| Raises an exception | Done (failed); not run again | No |
+| Calls `self.retry()`, or raises an exception in `autoretry_for`, with retries left | Run again after the retry delay | No |
+| Raises an `autoretry_for` exception after `max_retries` is used up | Done (failed); the exception is raised | No |
+| Hits `soft_time_limit` (`SoftTimeLimitExceeded`) | Put back in the queue once its lease expires | Yes |
+| Hits the hard `time_limit`, or the worker dies | Put back in the queue once its lease expires | Yes |
+
+- **Retries** (`self.retry()` and `autoretry_for`, with `retry_kwargs`, `retry_backoff`, etc.) behave as in plain Celery, and the item keeps its lease while it waits. `self.request.retries` counts them. The retry delay should stay well under `lease_seconds`: if the lease expires first, the retry is dropped and the item is run again as a timeout instead.
+- **Timeouts** are what `self.request.vtrr_timeouts` counts. A timed-out item is re-enqueued with a fresh position in the queue, and the count is never reset.
+- `SoftTimeLimitExceeded` is always treated as a timeout, even if it is listed in `autoretry_for`. It is never counted by `max_retries`.
 
 ### Celery configuration and timing
 
@@ -332,7 +345,7 @@ def process_file(self, ...):
     ...
 ```
 
-- **Hard `time_limit` is required.** `soft_time_limit` only raises an exception, which blocking C/IO code can delay or swallow. The hard limit kills the process, so by the time a lease expires the original holder is gone and reclaim rarely causes concurrent executions. Hitting the hard limit is itself recovered the same way: the lease is not acked, so the item is reclaimed after `lease_seconds` and its `timeouts` count goes up.
+- **Hard `time_limit` is required.** `soft_time_limit` only raises an exception, which blocking C/IO code can delay or swallow. The hard limit kills the process, so by the time a lease expires the original holder is gone and reclaim rarely causes concurrent executions. A task that hits either limit is put back in the queue after `lease_seconds` and counted as a timeout.
 - **`lease_seconds` > hard limit**, for the reason above.
 - A recovered item waits for its lease to expire, so worst-case recovery time is about `lease_seconds + reclaim_interval`.
 - If you do enable `acks_late`, the Redis transport's `visibility_timeout` (default 3600s, broker-wide) applies to it: a trigger held unacked longer is redelivered while still running. The lease token fences the duplicate, but keep `visibility_timeout` above your longest task.
