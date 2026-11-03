@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 import fakeredis
 import pytest
+from celery.exceptions import SoftTimeLimitExceeded
 
 import vtrr_queue.queue as vtrr_module
 from vtrr_queue.queue import VTRRQueue
@@ -578,6 +579,23 @@ class TestLeases:
         assert vtrr.reclaim() == ["t1"]
         assert vtrr._redis.hget(vtrr._timeouts_key, "t1") == b"1"
 
+    def test_wrapper_does_not_ack_on_soft_time_limit(self, vtrr, monkeypatch):
+        """SoftTimeLimitExceeded is treated like the hard limit: the lease is kept, so it
+        expires, the item is reclaimed, and the reclaim counts as a timeout."""
+
+        @vtrr.task
+        def work(self):
+            raise SoftTimeLimitExceeded
+
+        monkeypatch.setattr(vtrr, "_schedule_workers", lambda *a, **k: None)
+        work.queue(partition_key="A", tasks=[{"id": "t1"}])
+        with pytest.raises(SoftTimeLimitExceeded):
+            kick(work)
+        assert vtrr._redis.zscore(vtrr._inflight_key, "t1") is not None  # still leased
+        expire(vtrr, "t1")
+        assert vtrr.reclaim() == ["t1"]
+        assert vtrr._redis.hget(vtrr._timeouts_key, "t1") == b"1"
+
     def test_timeouts_is_visible_to_task(self, vtrr, monkeypatch):
         """A task run from a first dequeue sees self.request.vtrr_timeouts == 0."""
         seen = []
@@ -631,6 +649,74 @@ class TestRetryReleasesLease:
         work._celery_task.apply(kwargs={"is_start": True}, throw=False)
         assert in_flight == [1, 1]  # leased during the original run and the retry
         assert vtrr._redis.zcard(vtrr._inflight_key) == 0  # acked once, at the end
+
+    def test_autoretry_for_holds_lease_and_acks_at_end(self, vtrr, monkeypatch):
+        """An exception in autoretry_for keeps the lease through the retry, like self.retry()."""
+        in_flight = []
+
+        @vtrr.task(
+            autoretry_for=(ConnectionRefusedError,),
+            max_retries=2,
+            retry_kwargs={"countdown": 0},
+        )
+        def work(self):
+            in_flight.append(vtrr._redis.zcard(vtrr._inflight_key))
+            if len(in_flight) == 1:
+                raise ConnectionRefusedError
+
+        monkeypatch.setattr(vtrr, "_schedule_workers", lambda *a, **k: None)
+        work.queue(partition_key="A", tasks=[{"id": "t1"}])
+        work._celery_task.apply(kwargs={"is_start": True}, throw=False)
+        # Work able to run twice and so it was able to re-acquire the lease after the exception.
+        assert in_flight == [1, 1]
+        assert vtrr._redis.zcard(vtrr._inflight_key) == 0
+
+    def test_autoretry_for_acks_when_retries_exhausted(self, vtrr, monkeypatch):
+        """Once max_retries is used up the original exception propagates and the item is acked."""
+        runs = []
+
+        @vtrr.task(
+            autoretry_for=(ConnectionRefusedError,),
+            max_retries=1,
+            retry_kwargs={"countdown": 0},
+        )
+        def work(self):
+            runs.append(1)
+            raise ConnectionRefusedError
+
+        monkeypatch.setattr(vtrr, "_schedule_workers", lambda *a, **k: None)
+        work.queue(partition_key="A", tasks=[{"id": "t1"}])
+        # eager mode runs the retry inline, so the final exception surfaces through apply()
+        with pytest.raises(ConnectionRefusedError):
+            work._celery_task.apply(kwargs={"is_start": True}, throw=False)
+        assert len(runs) == 2  # original + 1 retry
+        assert vtrr._redis.zcard(vtrr._inflight_key) == 0
+        assert vtrr._redis.hget(vtrr._timeouts_key, "t1") is None
+
+    def test_soft_time_limit_in_autoretry_for_goes_through_lease_expiry(
+        self, vtrr, monkeypatch
+    ):
+        """SoftTimeLimitExceeded listed in autoretry_for is not Celery-retried: the lease is
+        kept until it expires, then the reclaim counts it as a timeout."""
+        runs = []
+
+        @vtrr.task(
+            autoretry_for=(SoftTimeLimitExceeded,),
+            max_retries=3,
+            retry_kwargs={"countdown": 0},
+        )
+        def work(self):
+            runs.append(1)
+            raise SoftTimeLimitExceeded
+
+        monkeypatch.setattr(vtrr, "_schedule_workers", lambda *a, **k: None)
+        work.queue(partition_key="A", tasks=[{"id": "t1"}])
+        work._celery_task.apply(kwargs={"is_start": True}, throw=False)
+        assert len(runs) == 1
+        assert vtrr._redis.zscore(vtrr._inflight_key, "t1") is not None
+        expire(vtrr, "t1")
+        assert vtrr.reclaim() == ["t1"]
+        assert vtrr._redis.hget(vtrr._timeouts_key, "t1") == b"1"
 
     def test_retry_dropped_when_lease_was_lost(self, vtrr):
         """A retry run whose token no longer matches any lease (reclaimed, re-granted or
